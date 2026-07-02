@@ -43,6 +43,9 @@ class Environment():
                            'sweep':      self.sweep,
                            'pick_place': self.pick_place}
 
+        self._ccda_video_recorder = None
+        self._ccda_video_label = ""
+
         # Set default movej timeout limit. For most tasks, 15 is reasonable.
         self.t_lim = 15
 
@@ -101,6 +104,26 @@ class Environment():
 
     def pause(self):
         self.running = False
+
+    def set_ccda_video_recorder(self, recorder):
+        """Attach an optional Phase1.1 video recorder.
+
+        When no recorder is attached, all CCDA video hooks are no-ops and the
+        environment behaves exactly as before.
+        """
+        self._ccda_video_recorder = recorder
+        self._ccda_video_label = ""
+
+    def _ccda_record_frame(self, label=""):
+        recorder = getattr(self, '_ccda_video_recorder', None)
+        if label and label != 'movej':
+            self._ccda_video_label = label
+        if recorder is None:
+            return
+        active_label = label
+        if label == 'movej' and self._ccda_video_label:
+            active_label = self._ccda_video_label
+        recorder.record(active_label)
 
     def is_static(self):
         """Checks if env is static, used for checking if action finished.
@@ -291,6 +314,7 @@ class Environment():
         # Wait for objects to settle, with a hard exit for bag tasks.
         start_t = time.time()
         while not self.is_static():
+            self._ccda_record_frame("settle")
             if self.is_bag_env() and (time.time() - start_t > 2.0):
                 break
             time.sleep(0.001)
@@ -465,6 +489,7 @@ class Environment():
                 controlMode=p.POSITION_CONTROL,
                 targetPositions=stepj,
                 positionGains=gains)
+            self._ccda_record_frame("movej")
             time.sleep(0.001)
         print('Warning: movej exceeded {} sec timeout. Skipping.'.format(t_lim))
         return False
@@ -570,19 +595,24 @@ class Environment():
 
         # Execute picking motion primitive.
         prepick_pose = np.hstack((prepick_position, pick_rotation))
+        self._ccda_record_frame("prepick")
         success &= self.movep(prepick_pose)
         target_pose = prepick_pose.copy()
         delta = np.array([0, 0, delta_z, 0, 0, 0, 0])
 
         # Lower gripper until (a) touch object (rigid OR softbody), or (b) hit ground.
+        self._ccda_record_frame("lower")
         while not self.ee.detect_contact(def_IDs) and target_pose[2] > 0:
             target_pose += delta
             success &= self.movep(target_pose)
 
         # Create constraint (rigid objects) or anchor (deformable).
+        self._ccda_record_frame("grasp")
         self.ee.activate(self.objects, def_IDs)
+        self._ccda_record_frame("grasp")
 
         # Increase z slightly (or hard-code it) and check picking success.
+        self._ccda_record_frame("lift")
         if self.is_softbody_env() or self.is_new_cable_env():
             prepick_pose[2] = postpick_z
             success &= self.movep(prepick_pose, speed=speed)
@@ -603,6 +633,7 @@ class Environment():
 
             # Execute placing motion primitive if pick success.
             preplace_pose = np.hstack((preplace_position, place_rotation))
+            self._ccda_record_frame("preplace")
             if self.is_softbody_env() or self.is_new_cable_env():
                 preplace_pose[2] = preplace_z
                 success &= self.movep(preplace_pose, speed=speed)
@@ -616,19 +647,24 @@ class Environment():
             # Lower the gripper. Here, we have a fixed speed=0.01. TODO: consider additional
             # testing with bags, so that the 'lowering' process for bags is more reliable.
             target_pose = preplace_pose.copy()
+            self._ccda_record_frame("lower")
             while not self.ee.detect_contact(def_IDs) and target_pose[2] > 0:
                 target_pose += delta
                 success &= self.movep(target_pose)
 
             # Release AND get gripper high up, to clear the view for images.
+            self._ccda_record_frame("release")
             self.ee.release()
             preplace_pose[2] = final_z
             success &= self.movep(preplace_pose)
+            self._ccda_record_frame("settle")
         else:
             # Release AND get gripper high up, to clear the view for images.
+            self._ccda_record_frame("release")
             self.ee.release()
             prepick_pose[2] = final_z
             success &= self.movep(prepick_pose)
+            self._ccda_record_frame("settle")
         return success
 
     def sweep(self, pose0, pose1):
