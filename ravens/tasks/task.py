@@ -659,7 +659,8 @@ class Task():
                 if (isinstance(self, tasks.names['cable']) or
                     isinstance(self, tasks.names['cable-shape']) or
                     isinstance(self, tasks.names['cable-shape-notarget']) or
-                    isinstance(self, tasks.names['cable-line-notarget'])):
+                    isinstance(self, tasks.names['cable-line-notarget']) or
+                    isinstance(self, tasks.names['hidden-contact-cable-line'])):
                     place_pose = (place_pose[0], (0, 0, 0, 1))
 
                 params = {'pose0': pick_pose, 'pose1': place_pose}

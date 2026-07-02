@@ -692,7 +692,7 @@ class Environment():
         """I want a way to track new cable-related stuff alone."""
         return (isinstance(self.task, tasks.names['cable-shape']) or
                 isinstance(self.task, tasks.names['cable-shape-notarget']) or
-                isinstance(self.task, tasks.names['cable-line-notarget']) or
+                isinstance(self.task, tasks.names['cable-line-notarget']) or isinstance(self.task, tasks.names['hidden-contact-cable-line']) or
                 isinstance(self.task, tasks.names['cable-ring']) or
                 isinstance(self.task, tasks.names['cable-ring-notarget']))
 

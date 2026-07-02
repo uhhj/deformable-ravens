@@ -165,7 +165,8 @@ class CableEnv(Task):
 
             # Get target placing positions for each cable bead, if applicable.
             if self._name == 'cable-shape' or self._name == 'cable-shape-notarget' or \
-                    self._name == 'cable-line-notarget':
+                    self._name == 'cable-line-notarget' or \
+                    self._name == 'hidden-contact-cable-line':
                 # ----------------------------------------------------------- #
                 # Here, zone_pose = square_pose, unlike Ravens cable, where the
                 # zone_pose is shifted so that its center matches the straight
