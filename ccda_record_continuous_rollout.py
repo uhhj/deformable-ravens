@@ -18,7 +18,6 @@ DEFAULT_CONDITIONS = [
     "free",
     "hidden_pin",
     "hidden_high_friction",
-    "hidden_side_jam",
 ]
 
 

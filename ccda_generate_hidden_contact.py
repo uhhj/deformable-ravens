@@ -129,7 +129,7 @@ def main():
     parser.add_argument(
         "--conditions",
         nargs="+",
-        default=["free", "hidden_pin", "hidden_high_friction", "hidden_side_jam"],
+        default=["free", "hidden_pin", "hidden_high_friction"],
     )
     parser.add_argument("--num_demos", type=int, default=5)
     parser.add_argument("--seed_start", type=int, default=0)

@@ -24,7 +24,6 @@ class HiddenContactCableLine(CableLineNoTarget):
       - free: no hidden contact.
       - hidden_pin: one bead is constrained to world / invisible anchor.
       - hidden_high_friction: several beads get high friction/damping.
-      - hidden_side_jam: invisible collision-only walls form a local jam.
 
     The hidden geometry is not added to env.objects or env.fixed_objects,
     so it is not returned by Environment.info. Collision-only bodies have
@@ -35,7 +34,6 @@ class HiddenContactCableLine(CableLineNoTarget):
         "free",
         "hidden_pin",
         "hidden_high_friction",
-        "hidden_side_jam",
     )
 
     def __init__(self):
@@ -160,8 +158,6 @@ class HiddenContactCableLine(CableLineNoTarget):
             self._apply_hidden_pin()
         elif self.hidden_condition == "hidden_high_friction":
             self._apply_hidden_high_friction()
-        elif self.hidden_condition == "hidden_side_jam":
-            self._apply_hidden_side_jam()
         else:
             raise ValueError(self.hidden_condition)
 
@@ -186,25 +182,6 @@ class HiddenContactCableLine(CableLineNoTarget):
             baseVisualShapeIndex=-1,
             basePosition=position,
             baseOrientation=(0, 0, 0, 1),
-        )
-        self.hidden_body_ids.append(body)
-        return body
-
-    def _make_invisible_box(self, position, half_extents, orientation=(0, 0, 0, 1)) -> int:
-        collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
-        body = p.createMultiBody(
-            baseMass=0,
-            baseCollisionShapeIndex=collision,
-            baseVisualShapeIndex=-1,
-            basePosition=position,
-            baseOrientation=orientation,
-        )
-        p.changeDynamics(
-            body,
-            -1,
-            lateralFriction=2.0,
-            spinningFriction=0.5,
-            rollingFriction=0.1,
         )
         self.hidden_body_ids.append(body)
         return body
@@ -280,39 +257,5 @@ class HiddenContactCableLine(CableLineNoTarget):
                 "rollingFriction": 0.5,
                 "linearDamping": 0.8,
                 "angularDamping": 0.8,
-            }
-        )
-
-    def _apply_hidden_side_jam(self) -> None:
-        mid = self._middle_bead_index()
-        bead_id = self.cable_bead_IDs[mid]
-        x, y, z = self._bead_position(bead_id)
-
-        # Two thin invisible collision-only side walls around the cable.
-        # The visual shape is disabled, so they should not be visible in RGB.
-        wall_z = max(0.010, z)
-        wall_len = 0.060
-        wall_thick = 0.004
-        wall_height = 0.018
-        gap = 0.016
-
-        wall_a = self._make_invisible_box(
-            position=(x, y + gap, wall_z),
-            half_extents=(wall_len, wall_thick, wall_height),
-        )
-        wall_b = self._make_invisible_box(
-            position=(x, y - gap, wall_z),
-            half_extents=(wall_len, wall_thick, wall_height),
-        )
-
-        self.hidden_contact_meta.update(
-            {
-                "condition": "hidden_side_jam",
-                "jam_reference_bead_local_index": int(mid),
-                "jam_reference_bead_id": int(bead_id),
-                "jam_reference_position": [float(x), float(y), float(z)],
-                "jam_wall_ids": [int(wall_a), int(wall_b)],
-                "jam_gap": float(gap),
-                "jam_wall_half_extents": [wall_len, wall_thick, wall_height],
             }
         )
