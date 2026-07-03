@@ -54,6 +54,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         self.hidden_constraint_ids: List[int] = []
         self.hidden_body_ids: List[int] = []
         self.hidden_contact_meta: Dict[str, Any] = {}
+        self._ccda_env = None
 
     def reset(self, env, last_info=None):
         """Reset the base cable-line task and inject hidden contact.
@@ -62,6 +63,8 @@ class HiddenContactCableLine(CableLineNoTarget):
         created and settled. This preserves the visible initial state as
         much as possible while changing only the hidden physical condition.
         """
+        self._ccda_env = env
+
         condition = os.environ.get("CCDA_HIDDEN_CONDITION", self.hidden_condition)
         self.hidden_condition = condition
         self.ccda_visible_seed = os.environ.get("CCDA_VISIBLE_SEED", self.ccda_visible_seed)
@@ -100,6 +103,67 @@ class HiddenContactCableLine(CableLineNoTarget):
         extras.update(self._ccda_extras())
         return reward, extras
 
+    def _robot_pose_proxy(self):
+        """Return a fixed-format robot proprio/proxy dict.
+
+        DeformableRavens uses high-level pick-place primitives, so this is not
+        full robot proprioception. We log the strongest available proxy:
+          1. PyBullet joint positions/velocities for env.ur5 if available.
+          2. End-effector/tool link pose if link state is accessible.
+          3. Otherwise a fixed zero vector with source='missing_zero_proxy'.
+
+        This must never include hidden_contact metadata.
+        """
+        env = getattr(self, "_ccda_env", None)
+        candidate_body_attrs = ["ur5", "ur5_id", "robot_id", "robot"]
+        body_id = None
+        if env is not None:
+            for attr in candidate_body_attrs:
+                value = getattr(env, attr, None)
+                if isinstance(value, (int, np.integer)):
+                    body_id = int(value)
+                    break
+
+        if body_id is not None:
+            try:
+                n_joints = int(p.getNumJoints(body_id))
+                joint_positions = []
+                joint_velocities = []
+                for j in range(n_joints):
+                    js = p.getJointState(body_id, j)
+                    joint_positions.append(float(js[0]))
+                    joint_velocities.append(float(js[1]))
+
+                ee_position = [0.0, 0.0, 0.0]
+                ee_orientation = [0.0, 0.0, 0.0, 1.0]
+                if n_joints > 0:
+                    try:
+                        link_state = p.getLinkState(body_id, n_joints - 1)
+                        ee_position = [float(v) for v in link_state[0]]
+                        ee_orientation = [float(v) for v in link_state[1]]
+                    except Exception:
+                        pass
+
+                return {
+                    "source": "pybullet_robot_body",
+                    "body_id": int(body_id),
+                    "joint_positions": joint_positions,
+                    "joint_velocities": joint_velocities,
+                    "ee_position": ee_position,
+                    "ee_orientation": ee_orientation,
+                }
+            except Exception:
+                pass
+
+        return {
+            "source": "missing_zero_proxy",
+            "body_id": None,
+            "joint_positions": [],
+            "joint_velocities": [],
+            "ee_position": [0.0, 0.0, 0.0],
+            "ee_orientation": [0.0, 0.0, 0.0, 1.0],
+        }
+
     def _ccda_extras(self) -> Dict[str, Any]:
         bead_states = self._ordered_bead_states()
         return {
@@ -109,6 +173,7 @@ class HiddenContactCableLine(CableLineNoTarget):
             "ccda_pair_group": self.ccda_pair_group,
             "hidden_contact_applied": self.hidden_contact_applied,
             "hidden_contact_meta": self.hidden_contact_meta,
+            "robot_pose_proxy": self._robot_pose_proxy(),
             "bead_ids": [int(x["id"]) for x in bead_states],
             "bead_positions": [x["position"] for x in bead_states],
             "bead_orientations": [x["orientation"] for x in bead_states],
