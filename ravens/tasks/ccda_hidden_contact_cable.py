@@ -64,6 +64,14 @@ class HiddenContactCableLine(CableLineNoTarget):
         self.hidden_contact_meta: Dict[str, Any] = {}
         self._ccda_env = None
 
+        self._ccda_step_count = 0
+        self._breakaway_released = False
+        self._breakaway_release_step = None
+        self._breakaway_anchor_pos = None
+        self._breakaway_bead_id = None
+        self._breakaway_constraint_id = None
+        self._breakaway_max_disp_seen = 0.0
+
     def reset(self, env, last_info=None):
         """Reset the base cable-line task and inject hidden contact.
 
@@ -94,6 +102,13 @@ class HiddenContactCableLine(CableLineNoTarget):
             "hidden_body_ids": [],
             "hidden_constraint_ids": [],
         }
+        self._ccda_step_count = 0
+        self._breakaway_released = False
+        self._breakaway_release_step = None
+        self._breakaway_anchor_pos = None
+        self._breakaway_bead_id = None
+        self._breakaway_constraint_id = None
+        self._breakaway_max_disp_seen = 0.0
 
         super().reset(env, last_info=last_info)
 
@@ -109,7 +124,10 @@ class HiddenContactCableLine(CableLineNoTarget):
 
     def reward(self):
         """Call original reward, then add CCDA logging fields."""
+        self._ccda_step_count += 1
+        self._maybe_update_breakaway()
         reward, extras = super().reward()
+        self._maybe_update_breakaway()
         extras.update(self._ccda_extras())
         return reward, extras
 
@@ -175,6 +193,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         }
 
     def _ccda_extras(self) -> Dict[str, Any]:
+        self._update_breakaway_meta_fields()
         bead_states = self._ordered_bead_states()
         return {
             "ccda_task": self._name,
@@ -256,7 +275,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         if condition == "hidden_soft_pin":
             return self._apply_hidden_pin(mode="soft")
         if condition == "hidden_breakaway_pin":
-            return self._apply_hidden_pin(mode="breakaway")
+            return self._apply_hidden_breakaway_pin()
         if condition == "hidden_friction_patch":
             return self._apply_hidden_friction_patch()
         raise ValueError("unknown hidden contact condition: {}".format(condition))
@@ -314,6 +333,109 @@ class HiddenContactCableLine(CableLineNoTarget):
         if mode == "breakaway":
             return float(os.environ.get("CCDA_BREAKAWAY_FORCE", "1.2"))
         raise ValueError(mode)
+
+    def _update_breakaway_meta_fields(self) -> None:
+        if self.hidden_condition != "hidden_breakaway_pin":
+            return
+        self.hidden_contact_meta["breakaway_released"] = bool(self._breakaway_released)
+        self.hidden_contact_meta["breakaway_release_step"] = self._breakaway_release_step
+        self.hidden_contact_meta["breakaway_max_disp_seen"] = float(self._breakaway_max_disp_seen)
+
+    def _maybe_update_breakaway(self) -> None:
+        if self.hidden_condition != "hidden_breakaway_pin":
+            return
+        if self._breakaway_released:
+            self._update_breakaway_meta_fields()
+            return
+        if self._breakaway_bead_id is None or self._breakaway_anchor_pos is None:
+            self._update_breakaway_meta_fields()
+            return
+        try:
+            bead_pos = np.asarray(
+                p.getBasePositionAndOrientation(int(self._breakaway_bead_id))[0],
+                dtype=np.float32,
+            )
+            anchor = np.asarray(self._breakaway_anchor_pos, dtype=np.float32)
+            disp = float(np.linalg.norm((bead_pos - anchor)[:2]))
+        except Exception:
+            self._update_breakaway_meta_fields()
+            return
+
+        self._breakaway_max_disp_seen = max(float(self._breakaway_max_disp_seen), disp)
+        threshold = float(os.environ.get("CCDA_BREAKAWAY_DISP", "0.035"))
+        min_step = int(os.environ.get("CCDA_BREAKAWAY_MIN_STEP", "1"))
+        if disp >= threshold and self._ccda_step_count >= min_step:
+            try:
+                if self._breakaway_constraint_id is not None:
+                    p.removeConstraint(int(self._breakaway_constraint_id))
+            except Exception:
+                pass
+            self._breakaway_released = True
+            self._breakaway_release_step = int(self._ccda_step_count)
+        self._update_breakaway_meta_fields()
+
+    def _apply_hidden_breakaway_pin(self) -> None:
+        bead_ratio = float(os.environ.get("CCDA_BREAKAWAY_BEAD_RATIO", "0.45"))
+        bead_ratio = min(max(bead_ratio, 0.05), 0.95)
+        idx = int(round(bead_ratio * (len(self.cable_bead_IDs) - 1)))
+        idx = max(0, min(len(self.cable_bead_IDs) - 1, idx))
+
+        bead_id = int(self.cable_bead_IDs[idx])
+        bead_pos = self._bead_position(bead_id)
+        max_force = float(os.environ.get("CCDA_BREAKAWAY_FORCE", "1.2"))
+        disp = float(os.environ.get("CCDA_BREAKAWAY_DISP", "0.035"))
+        damping = float(os.environ.get("CCDA_BREAKAWAY_DAMPING", "0.2"))
+
+        cid = p.createConstraint(
+            parentBodyUniqueId=bead_id,
+            parentLinkIndex=-1,
+            childBodyUniqueId=-1,
+            childLinkIndex=-1,
+            jointType=p.JOINT_POINT2POINT,
+            jointAxis=(0, 0, 0),
+            parentFramePosition=(0, 0, 0),
+            childFramePosition=bead_pos,
+        )
+        p.changeConstraint(cid, maxForce=max_force)
+        if damping > 0:
+            p.changeDynamics(bead_id, -1, linearDamping=damping, angularDamping=damping)
+
+        self.hidden_constraint_ids.append(int(cid))
+        self._breakaway_bead_id = int(bead_id)
+        self._breakaway_constraint_id = int(cid)
+        self._breakaway_anchor_pos = [float(x) for x in bead_pos]
+        self._breakaway_released = False
+        self._breakaway_release_step = None
+        self._breakaway_max_disp_seen = 0.0
+
+        params = self._base_recoverability_params("hidden_breakaway_pin")
+        params.update(
+            {
+                "breakaway_force": float(max_force),
+                "breakaway_disp": float(disp),
+                "breakaway_bead_ratio": float(bead_ratio),
+                "breakaway_damping": float(damping),
+            }
+        )
+        self.hidden_contact_meta.update(
+            {
+                "condition": "hidden_breakaway_pin",
+                "pin_mode": "breakaway",
+                "pin_bead_local_index": int(idx),
+                "pin_bead_id": int(bead_id),
+                "pin_anchor_position": [float(x) for x in bead_pos],
+                "pin_position": [float(x) for x in bead_pos],
+                "constraint_id": int(cid),
+                "max_force": float(max_force),
+                "breakaway_force": float(max_force),
+                "breakaway_disp": float(disp),
+                "breakaway_released": False,
+                "breakaway_release_step": None,
+                "breakaway_max_disp_seen": 0.0,
+                "recoverability_class_candidate": "recoverable_candidate",
+                "recoverability_params": params,
+            }
+        )
 
     def _apply_hidden_pin(self, mode: str = "hard") -> None:
         indices = self._pin_indices_for_mode(mode)
