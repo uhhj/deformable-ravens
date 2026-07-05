@@ -50,6 +50,39 @@ def safe_float(x: Any, default: float = float("nan")) -> float:
         return default
 
 
+
+
+def bool_success(row):
+    value = row.get("success", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
+def safe_int(x, default=0):
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def success_count_total(rows):
+    n = len(rows)
+    k = sum(1 for r in rows if bool_success(r))
+    return k, n, (float(k) / float(n) if n else float("nan"))
+
+
+def rows_by(rows, *keys):
+    out = {}
+    for r in rows:
+        kk = tuple(r.get(k) for k in keys)
+        out.setdefault(kk, []).append(r)
+    return out
+
+
+def seed_set(rows):
+    return sorted({safe_int(r.get("visible_seed", -1), -1) for r in rows})
+
 def sanitize_json(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {str(k): sanitize_json(v) for k, v in obj.items()}
@@ -546,31 +579,143 @@ def run_search(env, args, condition: str, seed: int, pair_group: str, policy: st
     return best
 
 
+def summarize_condition_rows_detailed(condition: str, condition_rows: list) -> dict:
+    by_policy = {}
+    for policy_key, rs in rows_by(condition_rows, "policy").items():
+        policy_name = policy_key[0] if isinstance(policy_key, tuple) else policy_key
+        k, n, rate = success_count_total(rs)
+
+        release_rows = [r for r in rs if "breakaway_released" in r]
+        release_k = sum(1 for r in release_rows if str(r.get("breakaway_released")).lower() in {"true", "1", "yes"})
+        release_rate = float(release_k) / float(len(release_rows)) if release_rows else float("nan")
+
+        div_vals = [safe_float(r.get("final_chamfer_to_free"), float("nan")) for r in rs]
+        div_vals = [x for x in div_vals if np.isfinite(x)]
+        release_steps = [safe_float(r.get("breakaway_release_step"), float("nan")) for r in rs if str(r.get("breakaway_released")).lower() in {"true", "1", "yes"}]
+        release_steps = [x for x in release_steps if np.isfinite(x)]
+
+        by_policy[policy_name] = {
+            "success_count": int(k),
+            "total": int(n),
+            "count": int(n),
+            "success_rate": float(rate),
+            "breakaway_released_count": int(release_k),
+            "breakaway_released_total": int(len(release_rows)),
+            "breakaway_released_rate": float(release_rate),
+            "breakaway_release_step_mean": float(np.mean(release_steps)) if release_steps else float("nan"),
+            "breakaway_max_disp_seen_mean": float(np.mean([safe_float(r.get("breakaway_max_disp_seen"), 0.0) for r in rs])) if rs else float("nan"),
+            "final_fraction_mean": float(np.mean([safe_float(r.get("final_fraction"), 0.0) for r in rs])) if rs else float("nan"),
+            "final_curve_mean": float(np.mean([safe_float(r.get("final_curve"), 0.0) for r in rs])) if rs else float("nan"),
+            "future_divergence_vs_free_mean": float(np.mean(div_vals)) if div_vals else float("nan"),
+        }
+
+    nominal_rows = [r for r in condition_rows if r.get("policy") == "nominal"]
+    guided_rows = [r for r in condition_rows if r.get("policy") == "guided_search"]
+    breakaway_oracle_rows = [r for r in condition_rows if r.get("policy") == "oracle_breakaway_then_place"]
+    oracle_rows = [r for r in condition_rows if r.get("policy") in ORACLE_POLICIES]
+
+    nominal_k, nominal_n, nominal_rate = success_count_total(nominal_rows)
+    guided_k, guided_n, guided_rate = success_count_total(guided_rows)
+    break_k, break_n, break_rate = success_count_total(breakaway_oracle_rows)
+    oracle_mean_k, oracle_mean_n, oracle_mean_rate = success_count_total(oracle_rows)
+
+    oracle_by_seed = {}
+    for r in oracle_rows:
+        sd = safe_int(r.get("visible_seed", -1), -1)
+        oracle_by_seed.setdefault(sd, []).append(r)
+    oracle_best_total = len(oracle_by_seed)
+    oracle_best_count = sum(1 for _, rs in oracle_by_seed.items() if any(bool_success(r) for r in rs))
+    oracle_best_rate = float(oracle_best_count) / float(oracle_best_total) if oracle_best_total else float("nan")
+
+    breakaway_meta_rows = [r for r in condition_rows if "breakaway_released" in r]
+    release_rows = [r for r in breakaway_meta_rows if str(r.get("breakaway_released")).lower() in {"true", "1", "yes"}]
+    release_rate = float(len(release_rows)) / float(len(breakaway_meta_rows)) if breakaway_meta_rows else float("nan")
+
+    release_success_k, release_success_n, release_success_rate = success_count_total(release_rows)
+    no_release_rows = [r for r in breakaway_meta_rows if str(r.get("breakaway_released")).lower() in {"false", "0", "no"}]
+    no_release_k, no_release_n, no_release_success_rate = success_count_total(no_release_rows)
+
+    divergence_vals = []
+    for stats in by_policy.values():
+        v = safe_float(stats.get("future_divergence_vs_free_mean"), float("nan"))
+        if np.isfinite(v):
+            divergence_vals.append(v)
+
+    return {
+        "condition": condition,
+        "policy_stats": by_policy,
+        "nominal_success_count": int(nominal_k),
+        "nominal_total": int(nominal_n),
+        "nominal_success": float(nominal_rate),
+        "guided_search_success_count": int(guided_k),
+        "guided_search_total": int(guided_n),
+        "guided_search_success": float(guided_rate),
+        "oracle_mean_success_count": int(oracle_mean_k),
+        "oracle_mean_total": int(oracle_mean_n),
+        "oracle_mean_success": float(oracle_mean_rate),
+        "oracle_best_success_count": int(oracle_best_count),
+        "oracle_best_total": int(oracle_best_total),
+        "oracle_best_success": float(oracle_best_rate),
+        "oracle_breakaway_then_place_success_count": int(break_k),
+        "oracle_breakaway_then_place_total": int(break_n),
+        "oracle_breakaway_then_place_success": float(break_rate),
+        "breakaway_released_count": int(len(release_rows)),
+        "breakaway_release_total": int(len(breakaway_meta_rows)),
+        "breakaway_released_rate": float(release_rate),
+        "release_success_count": int(release_success_k),
+        "release_success_total": int(release_success_n),
+        "release_success_rate": float(release_success_rate),
+        "no_release_success_count": int(no_release_k),
+        "no_release_success_total": int(no_release_n),
+        "no_release_success_rate": float(no_release_success_rate),
+        "future_divergence_vs_free": float(np.max(divergence_vals)) if divergence_vals else float("nan"),
+    }
+
+
 def summarize_rows(rows: List[Dict[str, Any]], conditions: List[str], policies: List[str]) -> Dict[str, Any]:
-    by_condition_policy = defaultdict(list)
-    for row in rows:
-        by_condition_policy[(row["condition"], row["policy"])].append(row)
+    condition_detailed = {}
     condition_summaries = {}
     for condition in conditions:
-        item = {}
-        for policy in policies:
-            rs = by_condition_policy.get((condition, policy), [])
-            if not rs:
-                continue
-            div_vals = [safe_float(r.get("final_chamfer_to_free"), float("nan")) for r in rs]
-            div_vals = [x for x in div_vals if np.isfinite(x)]
-            release_steps = [safe_float(r.get("breakaway_release_step"), float("nan")) for r in rs if r.get("breakaway_released")]
-            item[policy] = {"count": len(rs), "success_rate": float(np.mean([1.0 if r["success"] else 0.0 for r in rs])), "final_fraction_mean": float(np.mean([safe_float(r["final_fraction"], 0.0) for r in rs])), "final_curve_mean": float(np.mean([safe_float(r["final_curve"], 0.0) for r in rs])), "future_divergence_vs_free_mean": float(np.mean(div_vals)) if div_vals else float("nan"), "breakaway_released_rate": float(np.mean([1.0 if r.get("breakaway_released") else 0.0 for r in rs])), "breakaway_release_step_mean": float(np.mean(release_steps)) if release_steps else float("nan"), "breakaway_max_disp_seen_mean": float(np.mean([safe_float(r.get("breakaway_max_disp_seen"), 0.0) for r in rs]))}
-        nominal = item.get("nominal", {}).get("success_rate", 0.0)
-        oracle_rates = [item.get(p, {}).get("success_rate", 0.0) for p in ORACLE_POLICIES]
-        search_rates = [item.get(p, {}).get("success_rate", 0.0) for p in SEARCH_POLICIES]
-        oracle_success = max(oracle_rates) if oracle_rates else 0.0
-        search_best_success = max(search_rates) if search_rates else 0.0
-        divergence_vals = [v.get("future_divergence_vs_free_mean", float("nan")) for v in item.values()]
-        divergence_vals = [x for x in divergence_vals if np.isfinite(x)]
-        item["aggregate"] = {"nominal_success": float(nominal), "oracle_success": float(oracle_success), "search_best_success": float(search_best_success), "oracle_gap": float(oracle_success - nominal), "future_divergence_vs_free": float(np.max(divergence_vals)) if divergence_vals else float("nan")}
+        condition_rows = [r for r in rows if r.get("condition") == condition]
+        detailed = summarize_condition_rows_detailed(condition, condition_rows)
+        condition_detailed[condition] = detailed
+        item = dict(detailed["policy_stats"])
+        nominal = detailed["nominal_success"]
+        oracle_best = detailed["oracle_best_success"]
+        oracle_breakaway = detailed["oracle_breakaway_then_place_success"]
+        oracle_for_classification = max(
+            oracle_best if np.isfinite(oracle_best) else -1.0,
+            oracle_breakaway if np.isfinite(oracle_breakaway) else -1.0,
+        )
+        if oracle_for_classification < 0:
+            oracle_for_classification = 0.0
+        item["aggregate"] = {
+            "nominal_success": float(nominal),
+            "oracle_success": float(oracle_for_classification),
+            "oracle_mean_success": float(detailed["oracle_mean_success"]),
+            "oracle_best_success": float(oracle_best),
+            "oracle_breakaway_then_place_success": float(oracle_breakaway),
+            "search_best_success": float(detailed["guided_search_success"]),
+            "oracle_gap": float(oracle_for_classification - nominal),
+            "future_divergence_vs_free": detailed["future_divergence_vs_free"],
+            "nominal_success_count": detailed["nominal_success_count"],
+            "nominal_total": detailed["nominal_total"],
+            "oracle_best_success_count": detailed["oracle_best_success_count"],
+            "oracle_best_total": detailed["oracle_best_total"],
+            "oracle_breakaway_then_place_success_count": detailed["oracle_breakaway_then_place_success_count"],
+            "oracle_breakaway_then_place_total": detailed["oracle_breakaway_then_place_total"],
+            "breakaway_released_rate": detailed["breakaway_released_rate"],
+            "breakaway_released_count": detailed["breakaway_released_count"],
+            "breakaway_release_total": detailed["breakaway_release_total"],
+        }
         condition_summaries[condition] = item
-    return {"conditions": conditions, "policies": policies, "num_rows": len(rows), "condition_summaries": condition_summaries}
+    return {
+        "conditions": conditions,
+        "policies": policies,
+        "num_rows": len(rows),
+        "condition_summaries": condition_summaries,
+        "condition_detailed": condition_detailed,
+    }
 
 
 def run_audit(args) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -643,12 +788,75 @@ def write_outputs(args, rows: List[Dict[str, Any]], summary: Dict[str, Any]) -> 
                 out[key] = json.dumps(sanitize_json(value), sort_keys=True, allow_nan=False) if isinstance(value, (dict, list)) else value
             writer.writerow(out)
     json_path.write_text(json.dumps(sanitize_json(summary), indent=2, sort_keys=True, allow_nan=False))
-    lines = ["# Phase2.5 DeformableRavens Recoverability Audit", "", "| Condition | Nominal Success | Oracle Success | Search Best Success | Gap | Future Divergence vs Free |", "|---|---:|---:|---:|---:|---:|"]
-    for condition, item in summary["condition_summaries"].items():
-        agg = item["aggregate"]
+
+    def frac(k, n, rate):
+        if n:
+            return "{}/{} = {:.3f}".format(int(k), int(n), float(rate))
+        return "NA"
+
+    lines = [
+        "# Phase2.5 DeformableRavens Recoverability Audit",
+        "",
+        "| Condition | Nominal | Guided Search | Oracle Mean | Oracle Best | Oracle Breakaway | Gap(best-nominal) | Future Divergence vs Free |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for condition, detail in summary.get("condition_detailed", {}).items():
+        agg = summary["condition_summaries"][condition]["aggregate"]
         div = agg["future_divergence_vs_free"]
-        div_text = "nan" if not np.isfinite(div) else "{:.4f}".format(div)
-        lines.append("| {} | {:.3f} | {:.3f} | {:.3f} | {:.3f} | {} |".format(condition, agg["nominal_success"], agg["oracle_success"], agg["search_best_success"], agg["oracle_gap"], div_text))
+        div_text = "nan" if div is None or not np.isfinite(float(div)) else "{:.4f}".format(float(div))
+        lines.append(
+            "| {} | {} | {} | {} | {} | {} | {:.3f} | {} |".format(
+                condition,
+                frac(detail["nominal_success_count"], detail["nominal_total"], detail["nominal_success"]),
+                frac(detail["guided_search_success_count"], detail["guided_search_total"], detail["guided_search_success"]),
+                frac(detail["oracle_mean_success_count"], detail["oracle_mean_total"], detail["oracle_mean_success"]),
+                frac(detail["oracle_best_success_count"], detail["oracle_best_total"], detail["oracle_best_success"]),
+                frac(detail["oracle_breakaway_then_place_success_count"], detail["oracle_breakaway_then_place_total"], detail["oracle_breakaway_then_place_success"]),
+                agg["oracle_gap"],
+                div_text,
+            )
+        )
+
+    lines += [
+        "",
+        "## Detailed Success Counts",
+        "",
+        "| Condition | Policy | Success | Total | Rate | Breakaway Released |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    for condition, detail in summary.get("condition_detailed", {}).items():
+        for policy, stats in sorted(detail.get("policy_stats", {}).items()):
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} |".format(
+                    condition,
+                    policy,
+                    int(stats["success_count"]),
+                    int(stats["total"]),
+                    frac(stats["success_count"], stats["total"], stats["success_rate"]),
+                    frac(stats["breakaway_released_count"], stats["breakaway_released_total"], stats["breakaway_released_rate"]),
+                )
+            )
+
+    lines += [
+        "",
+        "## Oracle Decomposition",
+        "",
+        "| Condition | Nominal | Guided Search | Oracle Mean | Oracle Best | Oracle Breakaway | Breakaway Released |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for condition, detail in summary.get("condition_detailed", {}).items():
+        lines.append(
+            "| {} | {} | {} | {} | {} | {} | {} |".format(
+                condition,
+                frac(detail["nominal_success_count"], detail["nominal_total"], detail["nominal_success"]),
+                frac(detail["guided_search_success_count"], detail["guided_search_total"], detail["guided_search_success"]),
+                frac(detail["oracle_mean_success_count"], detail["oracle_mean_total"], detail["oracle_mean_success"]),
+                frac(detail["oracle_best_success_count"], detail["oracle_best_total"], detail["oracle_best_success"]),
+                frac(detail["oracle_breakaway_then_place_success_count"], detail["oracle_breakaway_then_place_total"], detail["oracle_breakaway_then_place_success"]),
+                frac(detail["breakaway_released_count"], detail["breakaway_release_total"], detail["breakaway_released_rate"]),
+            )
+        )
+
     lines += [
         "",
         "## Runtime",
@@ -658,6 +866,8 @@ def write_outputs(args, rows: List[Dict[str, Any]], summary: Dict[str, Any]) -> 
         "## Notes",
         "",
         "- Success is computed from `final_fraction >= 0.95`.",
+        "- `oracle_mean_success` is the mean over oracle-policy rows and is not used as the main recoverability criterion.",
+        "- `oracle_best_success` is computed per visible seed: any hidden-aware oracle success marks that seed as recoverable.",
         "- `hidden_pin` is retained as a hard/impossible diagnostic branch.",
         "- `nominal` on hidden conditions replays the paired free-branch oracle plan without hidden-state feedback.",
         "- `guided_search` is a geometry-guided executable policy used for search sanity.",
