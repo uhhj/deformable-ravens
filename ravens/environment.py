@@ -45,6 +45,10 @@ class Environment():
 
         self._ccda_video_recorder = None
         self._ccda_video_label = ""
+        # Phase3.12d-r1: serialize background physics with snapshot IO and
+        # surface task-hook failures instead of silently killing the thread.
+        self._ccda_step_lock = threading.RLock()
+        self._ccda_physics_hook_error = None
 
         # Set default movej timeout limit. For most tasks, 15 is reasonable.
         self.t_lim = 15
@@ -90,9 +94,19 @@ class Environment():
         p.setTimeStep(1.0 / self.hz)
         while True:
             if self.running:
-                p.stepSimulation()
-            if self.ee is not None:
-                self.ee.step()
+                with self._ccda_step_lock:
+                    p.stepSimulation()
+                    if self.ee is not None:
+                        self.ee.step()
+                    task = getattr(self, 'task', None)
+                    hook = getattr(task, 'physics_step_hook', None)
+                    if callable(hook):
+                        try:
+                            hook()
+                        except Exception as exc:
+                            # Do not let an exception silently terminate the daemon
+                            # thread. The rollout wrapper treats this as a hard error.
+                            self._ccda_physics_hook_error = repr(exc)
             time.sleep(0.001)
 
     def stop(self):

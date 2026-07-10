@@ -65,8 +65,10 @@ class HiddenContactCableLine(CableLineNoTarget):
         self._ccda_env = None
 
         self._ccda_step_count = 0
+        self._ccda_physics_step_count = 0
         self._breakaway_released = False
         self._breakaway_release_step = None
+        self._breakaway_release_physics_step = None
         self._breakaway_anchor_pos = None
         self._breakaway_bead_id = None
         self._breakaway_constraint_id = None
@@ -103,8 +105,10 @@ class HiddenContactCableLine(CableLineNoTarget):
             "hidden_constraint_ids": [],
         }
         self._ccda_step_count = 0
+        self._ccda_physics_step_count = 0
         self._breakaway_released = False
         self._breakaway_release_step = None
+        self._breakaway_release_physics_step = None
         self._breakaway_anchor_pos = None
         self._breakaway_bead_id = None
         self._breakaway_constraint_id = None
@@ -122,12 +126,24 @@ class HiddenContactCableLine(CableLineNoTarget):
             time.sleep(settle_seconds)
             env.pause()
 
+    def physics_step_hook(self):
+        """Update recoverable hidden contact at every simulated physics step.
+
+        The old implementation checked displacement only from reward(), after a
+        full pick-place primitive and settling. A bead could exceed the release
+        threshold transiently during the pull and return before reward(), which
+        incorrectly kept the pin attached.
+        """
+        self._ccda_physics_step_count += 1
+        self._maybe_update_breakaway(check_source="physics")
+
     def reward(self):
         """Call original reward, then add CCDA logging fields."""
         self._ccda_step_count += 1
-        self._maybe_update_breakaway()
+        # Fallback checks keep direct/manual stepping and legacy callers safe.
+        self._maybe_update_breakaway(check_source="reward_pre")
         reward, extras = super().reward()
-        self._maybe_update_breakaway()
+        self._maybe_update_breakaway(check_source="reward_post")
         extras.update(self._ccda_extras())
         return reward, extras
 
@@ -337,11 +353,23 @@ class HiddenContactCableLine(CableLineNoTarget):
     def _update_breakaway_meta_fields(self) -> None:
         if self.hidden_condition != "hidden_breakaway_pin":
             return
-        self.hidden_contact_meta["breakaway_released"] = bool(self._breakaway_released)
-        self.hidden_contact_meta["breakaway_release_step"] = self._breakaway_release_step
-        self.hidden_contact_meta["breakaway_max_disp_seen"] = float(self._breakaway_max_disp_seen)
+        self.hidden_contact_meta["breakaway_released"] = bool(
+            self._breakaway_released
+        )
+        self.hidden_contact_meta["breakaway_release_step"] = (
+            self._breakaway_release_step
+        )
+        self.hidden_contact_meta["breakaway_release_physics_step"] = (
+            self._breakaway_release_physics_step
+        )
+        self.hidden_contact_meta["breakaway_max_disp_seen"] = float(
+            self._breakaway_max_disp_seen
+        )
+        self.hidden_contact_meta["ccda_physics_step_count"] = int(
+            self._ccda_physics_step_count
+        )
 
-    def _maybe_update_breakaway(self) -> None:
+    def _maybe_update_breakaway(self, check_source="reward") -> None:
         if self.hidden_condition != "hidden_breakaway_pin":
             return
         if self._breakaway_released:
@@ -350,28 +378,71 @@ class HiddenContactCableLine(CableLineNoTarget):
         if self._breakaway_bead_id is None or self._breakaway_anchor_pos is None:
             self._update_breakaway_meta_fields()
             return
+
         try:
             bead_pos = np.asarray(
-                p.getBasePositionAndOrientation(int(self._breakaway_bead_id))[0],
+                p.getBasePositionAndOrientation(
+                    int(self._breakaway_bead_id)
+                )[0],
                 dtype=np.float32,
             )
-            anchor = np.asarray(self._breakaway_anchor_pos, dtype=np.float32)
+            anchor = np.asarray(
+                self._breakaway_anchor_pos, dtype=np.float32
+            )
             disp = float(np.linalg.norm((bead_pos - anchor)[:2]))
         except Exception:
             self._update_breakaway_meta_fields()
             return
 
-        self._breakaway_max_disp_seen = max(float(self._breakaway_max_disp_seen), disp)
-        threshold = float(os.environ.get("CCDA_BREAKAWAY_DISP", "0.035"))
-        min_step = int(os.environ.get("CCDA_BREAKAWAY_MIN_STEP", "1"))
-        if disp >= threshold and self._ccda_step_count >= min_step:
-            try:
-                if self._breakaway_constraint_id is not None:
-                    p.removeConstraint(int(self._breakaway_constraint_id))
-            except Exception:
-                pass
-            self._breakaway_released = True
-            self._breakaway_release_step = int(self._ccda_step_count)
+        self._breakaway_max_disp_seen = max(
+            float(self._breakaway_max_disp_seen), disp
+        )
+        threshold = float(
+            os.environ.get("CCDA_BREAKAWAY_DISP", "0.035")
+        )
+        min_physics_steps = int(
+            os.environ.get("CCDA_BREAKAWAY_MIN_PHYSICS_STEPS", "1")
+        )
+
+        # reward() may run before the background thread has advanced. Keep the
+        # old action-step fallback only when explicitly requested; normal task
+        # execution releases according to actual physics-step displacement.
+        physics_ready = (
+            self._ccda_physics_step_count >= min_physics_steps
+        )
+        reward_fallback = (
+            str(check_source).startswith("reward")
+            and self._ccda_step_count
+            >= int(os.environ.get("CCDA_BREAKAWAY_MIN_STEP", "1"))
+        )
+        if disp < threshold or not (physics_ready or reward_fallback):
+            self._update_breakaway_meta_fields()
+            return
+
+        released_constraint_id = self._breakaway_constraint_id
+        try:
+            if released_constraint_id is not None:
+                p.removeConstraint(int(released_constraint_id))
+        except Exception:
+            # If it was already absent, treat the latent contact as released.
+            pass
+
+        self.hidden_constraint_ids = [
+            int(cid)
+            for cid in self.hidden_constraint_ids
+            if int(cid) != int(released_constraint_id)
+        ] if released_constraint_id is not None else list(
+            self.hidden_constraint_ids
+        )
+        self._breakaway_constraint_id = None
+        self._breakaway_released = True
+        self._breakaway_release_step = int(self._ccda_step_count)
+        self._breakaway_release_physics_step = int(
+            self._ccda_physics_step_count
+        )
+        self.hidden_contact_meta["breakaway_release_source"] = str(
+            check_source
+        )
         self._update_breakaway_meta_fields()
 
     def _apply_hidden_breakaway_pin(self) -> None:
@@ -406,6 +477,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         self._breakaway_anchor_pos = [float(x) for x in bead_pos]
         self._breakaway_released = False
         self._breakaway_release_step = None
+        self._breakaway_release_physics_step = None
         self._breakaway_max_disp_seen = 0.0
 
         params = self._base_recoverability_params("hidden_breakaway_pin")
@@ -431,6 +503,10 @@ class HiddenContactCableLine(CableLineNoTarget):
                 "breakaway_disp": float(disp),
                 "breakaway_released": False,
                 "breakaway_release_step": None,
+                "breakaway_release_physics_step": None,
+                "ccda_physics_step_count": int(
+                    self._ccda_physics_step_count
+                ),
                 "breakaway_max_disp_seen": 0.0,
                 "recoverability_class_candidate": "recoverable_candidate",
                 "recoverability_params": params,
