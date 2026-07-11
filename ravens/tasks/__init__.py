@@ -24,7 +24,7 @@ from ravens.tasks.defs_cables import (
         CableRing, CableRingNoTarget)
 from ravens.tasks.defs_cloth import (
         ClothFlat, ClothFlatNoTarget, ClothCover)
-from ravens.tasks.ccda_hidden_contact_cable import HiddenContactCableLine
+from ravens.tasks.ccda_slack_cable_v2 import CCDASlackCableV2
 from ravens.tasks.defs_bags import (
         BagAloneOpen, BagItemsEasy, BagItemsHard, BagColorGoal)
 
@@ -43,7 +43,8 @@ names = {'sorting':             Sorting,
          'insertion-goal':      InsertionGoal, # start of custom envs
          'cable-shape':         CableShape,
          'cable-shape-notarget': CableShapeNoTarget,
-         'cable-line-notarget': CableLineNoTarget, 'hidden-contact-cable-line': HiddenContactCableLine,
+         'cable-line-notarget': CableLineNoTarget,
+         'ccda-slack-cable-v2': CCDASlackCableV2,
          'cable-ring':          CableRing,
          'cable-ring-notarget': CableRingNoTarget,
          'cloth-flat':          ClothFlat,
