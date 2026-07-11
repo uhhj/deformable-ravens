@@ -7,6 +7,7 @@ contact conditions after reset. Hidden contact metadata and ordered bead
 states are added to info['extras'] through reward().
 """
 
+# PHASE3_12D_R24_SLACK_BREAKAWAY_V2
 import os
 import time
 from typing import Any, Dict, List, Tuple
@@ -15,6 +16,10 @@ import numpy as np
 import pybullet as p
 
 from ravens.tasks.defs_cables import CableLineNoTarget
+from ravens.tasks.ccda_slack_breakaway import (
+    SlackBreakawayConfig,
+    UnilateralSlackBreakaway,
+)
 
 
 class HiddenContactCableLine(CableLineNoTarget):
@@ -41,6 +46,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         "hidden_partial_pin",
         "hidden_soft_pin",
         "hidden_breakaway_pin",
+        "hidden_slack_breakaway_pin_v2",
         "hidden_friction_patch",
     )
 
@@ -73,6 +79,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         self._breakaway_bead_id = None
         self._breakaway_constraint_id = None
         self._breakaway_max_disp_seen = 0.0
+        self._reset_slack_breakaway_v2_state()
 
         # PHASE3_12D_R2_DEFERRED_ARMING: hidden conditions are created only after the common
         # visible cable settling phase.
@@ -85,6 +92,16 @@ class HiddenContactCableLine(CableLineNoTarget):
         self._hidden_contact_arm_post_xy = None
         self._hidden_contact_arm_max_abs_jump = 0.0
         self._hidden_contact_arm_mae_jump = 0.0
+
+    def _reset_slack_breakaway_v2_state(self) -> None:
+        self._slack_model = None
+        self._slack_bead_id = None
+        self._slack_bead_local_index = None
+        self._slack_last_output = None
+        self._slack_last_applied_force = [0.0, 0.0, 0.0]
+        self._slack_environment_semantics_version = (
+            "ccda_hidden_slack_breakaway_v2"
+        )
 
     def reset(self, env, last_info=None):
         """Reset the base cable-line task and inject hidden contact.
@@ -125,6 +142,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         self._breakaway_bead_id = None
         self._breakaway_constraint_id = None
         self._breakaway_max_disp_seen = 0.0
+        self._reset_slack_breakaway_v2_state()
         self._hidden_contact_pending = False
         self._hidden_contact_armed = False
         self._hidden_contact_arm_mode = "reset"
@@ -294,6 +312,44 @@ class HiddenContactCableLine(CableLineNoTarget):
             "hidden_constraint_ids": [int(x) for x in self.hidden_constraint_ids],
         }
 
+    def physics_pre_step_hook(self):
+        # Apply v2 unilateral tether force before the simulation step.
+        if self.hidden_condition != "hidden_slack_breakaway_pin_v2":
+            return
+        if not self._hidden_contact_armed:
+            self._update_slack_breakaway_v2_meta_fields()
+            return
+        if self._slack_model is None or self._slack_bead_id is None:
+            raise RuntimeError(
+                "slack-breakaway v2 is armed without a model or bead"
+            )
+
+        bead_id = int(self._slack_bead_id)
+        position = p.getBasePositionAndOrientation(bead_id)[0]
+        linear_velocity = p.getBaseVelocity(bead_id)[0]
+        output = self._slack_model.evaluate(
+            position,
+            linear_velocity,
+            physics_step=int(self._ccda_physics_step_count) + 1,
+        )
+        force = np.asarray(output.force_xyz, dtype=np.float64)
+        if force.shape != (3,) or not np.all(np.isfinite(force)):
+            raise RuntimeError("non-finite slack tether force")
+
+        self._slack_last_output = output
+        self._slack_last_applied_force = force.astype(float).tolist()
+
+        if np.any(force != 0.0):
+            p.applyExternalForce(
+                bead_id,
+                -1,
+                forceObj=force.astype(float).tolist(),
+                posObj=[float(value) for value in position],
+                flags=p.WORLD_FRAME,
+            )
+
+        self._update_slack_breakaway_v2_meta_fields()
+
     def physics_step_hook(self):
         """Update recoverable hidden contact at every simulated physics step.
 
@@ -304,6 +360,7 @@ class HiddenContactCableLine(CableLineNoTarget):
         """
         self._ccda_physics_step_count += 1
         self._maybe_update_breakaway(check_source="physics")
+        self._update_slack_breakaway_v2_meta_fields()
 
     def reward(self):
         """Call original reward, then add CCDA logging fields."""
@@ -379,6 +436,7 @@ class HiddenContactCableLine(CableLineNoTarget):
     def _ccda_extras(self) -> Dict[str, Any]:
         self._update_hidden_arm_meta_fields()
         self._update_breakaway_meta_fields()
+        self._update_slack_breakaway_v2_meta_fields()
         bead_states = self._ordered_bead_states()
         return {
             "ccda_task": self._name,
@@ -461,6 +519,8 @@ class HiddenContactCableLine(CableLineNoTarget):
             return self._apply_hidden_pin(mode="soft")
         if condition == "hidden_breakaway_pin":
             return self._apply_hidden_breakaway_pin()
+        if condition == "hidden_slack_breakaway_pin_v2":
+            return self._apply_hidden_slack_breakaway_pin_v2()
         if condition == "hidden_friction_patch":
             return self._apply_hidden_friction_patch()
         raise ValueError("unknown hidden contact condition: {}".format(condition))
@@ -684,6 +744,218 @@ class HiddenContactCableLine(CableLineNoTarget):
                 "recoverability_params": params,
             }
         )
+
+    def _slack_breakaway_v2_config(self) -> SlackBreakawayConfig:
+        return SlackBreakawayConfig(
+            slack_distance=float(
+                os.environ.get("CCDA_SLACK_V2_DISTANCE", "0.010")
+            ),
+            spring_stiffness=float(
+                os.environ.get("CCDA_SLACK_V2_STIFFNESS", "100.0")
+            ),
+            radial_damping=float(
+                os.environ.get("CCDA_SLACK_V2_DAMPING", "0.20")
+            ),
+            max_tension=float(
+                os.environ.get("CCDA_SLACK_V2_MAX_TENSION", "4.0")
+            ),
+            breakaway_extension=float(
+                os.environ.get(
+                    "CCDA_SLACK_V2_BREAKAWAY_EXTENSION",
+                    "0.030",
+                )
+            ),
+            breakaway_force=float(
+                os.environ.get(
+                    "CCDA_SLACK_V2_BREAKAWAY_FORCE",
+                    "3.0",
+                )
+            ),
+        )
+
+    def _update_slack_breakaway_v2_meta_fields(self) -> None:
+        if self.hidden_condition != "hidden_slack_breakaway_pin_v2":
+            return
+
+        model = self._slack_model
+        snapshot = model.snapshot() if model is not None else None
+        self.hidden_contact_meta.update(
+            {
+                "environment_semantics_version":
+                    self._slack_environment_semantics_version,
+                "condition": "hidden_slack_breakaway_pin_v2",
+                "force_model": "unilateral_deadband_spring",
+                "uses_world_constraint": False,
+                "contains_no_action_force_below_deadband": True,
+                "slack_bead_id": self._slack_bead_id,
+                "slack_bead_local_index": self._slack_bead_local_index,
+                "slack_state": (
+                    snapshot["state"] if snapshot is not None else None
+                ),
+                "slack_anchor_xy": (
+                    snapshot["anchor_xy"] if snapshot is not None else None
+                ),
+                "slack_engagement_physics_step": (
+                    snapshot["engagement_physics_step"]
+                    if snapshot is not None
+                    else None
+                ),
+                "slack_release_physics_step": (
+                    snapshot["release_physics_step"]
+                    if snapshot is not None
+                    else None
+                ),
+                "slack_release_reason": (
+                    snapshot["release_reason"]
+                    if snapshot is not None
+                    else None
+                ),
+                "slack_max_radial_distance": (
+                    snapshot["max_radial_distance"]
+                    if snapshot is not None
+                    else 0.0
+                ),
+                "slack_max_extension": (
+                    snapshot["max_extension"]
+                    if snapshot is not None
+                    else 0.0
+                ),
+                "slack_max_tension": (
+                    snapshot["max_tension"]
+                    if snapshot is not None
+                    else 0.0
+                ),
+                "slack_last_tension": (
+                    snapshot["last_tension"]
+                    if snapshot is not None
+                    else 0.0
+                ),
+                "slack_last_force": list(
+                    self._slack_last_applied_force
+                ),
+                "hidden_body_ids": [
+                    int(value) for value in self.hidden_body_ids
+                ],
+                "hidden_constraint_ids": [
+                    int(value) for value in self.hidden_constraint_ids
+                ],
+            }
+        )
+
+    def _apply_hidden_slack_breakaway_pin_v2(self) -> None:
+        if self.hidden_body_ids or self.hidden_constraint_ids:
+            raise RuntimeError(
+                "slack-breakaway v2 must not create hidden bodies or "
+                "PyBullet constraints"
+            )
+
+        bead_ratio = float(
+            os.environ.get("CCDA_SLACK_V2_BEAD_RATIO", "0.45")
+        )
+        bead_ratio = min(max(bead_ratio, 0.05), 0.95)
+        index = int(
+            round(bead_ratio * (len(self.cable_bead_IDs) - 1))
+        )
+        index = max(0, min(len(self.cable_bead_IDs) - 1, index))
+        bead_id = int(self.cable_bead_IDs[index])
+        bead_position = self._bead_position(bead_id)
+
+        self._slack_bead_id = bead_id
+        self._slack_bead_local_index = index
+        self._slack_model = UnilateralSlackBreakaway(
+            config=self._slack_breakaway_v2_config(),
+            anchor_position=bead_position,
+        )
+        self._slack_last_output = None
+        self._slack_last_applied_force = [0.0, 0.0, 0.0]
+
+        parameters = self._base_recoverability_params(
+            "hidden_slack_breakaway_pin_v2"
+        )
+        parameters.update(self._slack_model.snapshot()["config"])
+
+        self.hidden_contact_meta.update(
+            {
+                "condition": "hidden_slack_breakaway_pin_v2",
+                "recoverability_class_candidate":
+                    "recoverable_candidate",
+                "recoverability_params": parameters,
+                "environment_semantics_version":
+                    self._slack_environment_semantics_version,
+                "force_model": "unilateral_deadband_spring",
+                "uses_world_constraint": False,
+                "contains_no_action_force_below_deadband": True,
+            }
+        )
+        self._update_slack_breakaway_v2_meta_fields()
+
+    def ccda_snapshot_state(self) -> Dict[str, Any]:
+        # Capture Python-side state not included in p.saveState().
+        return {
+            "snapshot_version": "ccda_task_snapshot_v2",
+            "hidden_condition": str(self.hidden_condition),
+            "ccda_step_count": int(self._ccda_step_count),
+            "ccda_physics_step_count": int(
+                self._ccda_physics_step_count
+            ),
+            "hidden_contact_pending": bool(
+                self._hidden_contact_pending
+            ),
+            "hidden_contact_armed": bool(
+                self._hidden_contact_armed
+            ),
+            "slack_bead_id": self._slack_bead_id,
+            "slack_bead_local_index": self._slack_bead_local_index,
+            "slack_last_applied_force": list(
+                self._slack_last_applied_force
+            ),
+            "slack_model": (
+                self._slack_model.snapshot()
+                if self._slack_model is not None
+                else None
+            ),
+        }
+
+    def ccda_restore_state(self, snapshot: Dict[str, Any]) -> None:
+        # Restore Python-side state after p.restoreState().
+        if snapshot.get("snapshot_version") != "ccda_task_snapshot_v2":
+            raise ValueError("unsupported CCDA task snapshot")
+        if str(snapshot["hidden_condition"]) != str(
+            self.hidden_condition
+        ):
+            raise ValueError("snapshot hidden condition mismatch")
+
+        self._ccda_step_count = int(snapshot["ccda_step_count"])
+        self._ccda_physics_step_count = int(
+            snapshot["ccda_physics_step_count"]
+        )
+        self._hidden_contact_pending = bool(
+            snapshot["hidden_contact_pending"]
+        )
+        self._hidden_contact_armed = bool(
+            snapshot["hidden_contact_armed"]
+        )
+        self._slack_bead_id = snapshot.get("slack_bead_id")
+        self._slack_bead_local_index = snapshot.get(
+            "slack_bead_local_index"
+        )
+        self._slack_last_applied_force = [
+            float(value)
+            for value in snapshot.get(
+                "slack_last_applied_force",
+                [0.0, 0.0, 0.0],
+            )
+        ]
+
+        model_snapshot = snapshot.get("slack_model")
+        self._slack_model = (
+            UnilateralSlackBreakaway.from_snapshot(model_snapshot)
+            if model_snapshot is not None
+            else None
+        )
+        self._slack_last_output = None
+        self._update_hidden_arm_meta_fields()
+        self._update_slack_breakaway_v2_meta_fields()
 
     def _apply_hidden_pin(self, mode: str = "hard") -> None:
         indices = self._pin_indices_for_mode(mode)

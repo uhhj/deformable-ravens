@@ -95,10 +95,23 @@ class Environment():
         while True:
             if self.running:
                 with self._ccda_step_lock:
+                    # PHASE3_12D_R24_SLACK_BREAKAWAY_V2: forces must be applied before the PyBullet
+                    # step in which they are intended to act.
+                    task = getattr(self, 'task', None)
+                    pre_hook = getattr(task, 'physics_pre_step_hook', None)
+                    if callable(pre_hook):
+                        try:
+                            pre_hook()
+                        except Exception as exc:
+                            if self._ccda_physics_hook_error is None:
+                                self._ccda_physics_hook_error = (
+                                    "physics_pre_step_hook: " + repr(exc)
+                                )
+
                     p.stepSimulation()
                     if self.ee is not None:
                         self.ee.step()
-                    task = getattr(self, 'task', None)
+
                     hook = getattr(task, 'physics_step_hook', None)
                     if callable(hook):
                         try:
@@ -106,7 +119,10 @@ class Environment():
                         except Exception as exc:
                             # Do not let an exception silently terminate the daemon
                             # thread. The rollout wrapper treats this as a hard error.
-                            self._ccda_physics_hook_error = repr(exc)
+                            if self._ccda_physics_hook_error is None:
+                                self._ccda_physics_hook_error = (
+                                    "physics_step_hook: " + repr(exc)
+                                )
             time.sleep(0.001)
 
     def stop(self):
@@ -189,6 +205,7 @@ class Environment():
                 becoming a time bottleneck, judging from my profiling.
         """
         self.pause()
+        self._ccda_physics_hook_error = None
         self.task = task
         self.objects = []
         self.fixed_objects = []
