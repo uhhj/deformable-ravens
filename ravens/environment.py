@@ -49,6 +49,7 @@ class Environment():
         # surface task-hook failures instead of silently killing the thread.
         self._ccda_step_lock = threading.RLock()
         self._ccda_physics_hook_error = None
+        self._stop_event = threading.Event()
 
         # Set default movej timeout limit. For most tasks, 15 is reasonable.
         self.t_lim = 15
@@ -92,7 +93,7 @@ class Environment():
         visualize PyBullet with the GUI to make it not move too fast
         """
         p.setTimeStep(1.0 / self.hz)
-        while True:
+        while not self._stop_event.is_set():
             if self.running:
                 with self._ccda_step_lock:
                     # PHASE3_12D_R24_SLACK_BREAKAWAY_V2: forces must be applied before the PyBullet
@@ -126,8 +127,13 @@ class Environment():
             time.sleep(0.001)
 
     def stop(self):
-        p.disconnect()
-        del self.step_thread
+        self.running = False
+        self._stop_event.set()
+        if self.step_thread.is_alive():
+            self.step_thread.join(timeout=1.0)
+        with self._ccda_step_lock:
+            if p.isConnected():
+                p.disconnect()
 
     def start(self):
         self.running = True
@@ -296,6 +302,11 @@ class Environment():
         if disable_render_load:
             p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
         (obs, _, _, _) = self.step()
+        if isinstance(self.task, tasks.names['ccda-hidden-friction-cable']):
+            # Arm only after the visible force-free geometry has settled.
+            self.pause()
+            self.task.arm_hidden_friction_after_settle()
+            self.start()
         return obs
 
     def step(self, act=None):
@@ -761,6 +772,7 @@ class Environment():
                 isinstance(self.task, tasks.names['cable-shape-notarget']) or
                 isinstance(self.task, tasks.names['cable-line-notarget']) or
                 isinstance(self.task, tasks.names['ccda-slack-cable-v2']) or
+                isinstance(self.task, tasks.names['ccda-hidden-friction-cable']) or
                 isinstance(self.task, tasks.names['cable-ring']) or
                 isinstance(self.task, tasks.names['cable-ring-notarget']))
 
