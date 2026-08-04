@@ -142,13 +142,13 @@ class Environment():
         self.running = False
 
     def set_ccda_video_recorder(self, recorder):
-        """Attach an optional Phase1.1 video recorder.
-
-        When no recorder is attached, all CCDA video hooks are no-ops and the
-        environment behaves exactly as before.
-        """
+        """Attach or detach an optional CCDA simulation video recorder."""
         self._ccda_video_recorder = recorder
         self._ccda_video_label = ""
+
+    def record_ccda_frame(self, label=""):
+        """Public frame-capture entry point for idle simulation phases."""
+        self._ccda_record_frame(label)
 
     def _ccda_record_frame(self, label=""):
         recorder = getattr(self, '_ccda_video_recorder', None)
@@ -159,7 +159,8 @@ class Environment():
         active_label = label
         if label == 'movej' and self._ccda_video_label:
             active_label = self._ccda_video_label
-        recorder.record(active_label)
+        with self._ccda_step_lock:
+            recorder.record(active_label)
 
     def is_static(self):
         """Checks if env is static, used for checking if action finished.

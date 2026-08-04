@@ -244,6 +244,9 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
             raise ValueError(f"invalid CCDA phase {phase!r}; expected one of {self.VALID_PHASES}")
         self._phase = phase
 
+    def ccda_phase(self) -> str:
+        return str(self._phase)
+
     def ccda_trace(self) -> List[Dict[str, Any]]:
         return copy.deepcopy(self._trace)
 
