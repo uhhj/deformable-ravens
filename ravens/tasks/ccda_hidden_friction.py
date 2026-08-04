@@ -27,6 +27,36 @@ class HiddenFrictionConfig:
 
 
 @dataclass(frozen=True)
+class NativeSegmentFrictionConfig:
+    base_lateral_friction: float
+    hidden_lateral_friction: float
+    spinning_friction: float
+    rolling_friction: float
+    restitution: float
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.hidden_lateral_friction <= self.base_lateral_friction:
+            raise ValueError(
+                "hidden_lateral_friction must exceed base_lateral_friction"
+            )
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "snapshot_version": "ccda_native_segment_friction_v1",
+            "config": {
+                name: float(value)
+                for name, value in asdict(self).items()
+            },
+        }
+
+
+@dataclass(frozen=True)
 class HiddenFrictionOutput:
     force_xyz: np.ndarray
     active: bool

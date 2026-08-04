@@ -40,6 +40,8 @@ class Environment():
         """
         self.ee = None
         self.task = None
+        self.plane_id = None
+        self.workspace_id = None
         self.objects = []
         self.running = False
         self.fixed_objects = []
@@ -48,7 +50,8 @@ class Environment():
         self.primitives = {'push':       self.push,
                            'sweep':      self.sweep,
                            'pick_place': self.pick_place,
-                           'pick_probe_return': self.pick_probe_return}
+                           'pick_probe_return': self.pick_probe_return,
+                           'pick_planar_microprobe': self.pick_planar_microprobe}
 
         self._ccda_video_recorder = None
         self._ccda_video_label = ""
@@ -245,6 +248,55 @@ class Environment():
         with self._ccda_step_lock:
             recorder.record(active_label)
 
+    def ccda_sensor_observation(self):
+        """Robot-observable force proxies without hidden task labels."""
+        joint_states = [
+            p.getJointState(self.ur5, int(joint))
+            for joint in self.joints
+        ]
+        joint_motor_torque = np.asarray(
+            [float(state[3]) for state in joint_states],
+            dtype=np.float64,
+        )
+
+        suction_force = np.zeros(3, dtype=np.float64)
+        suction_torque = np.zeros(3, dtype=np.float64)
+        constraint_available = False
+        constraint_id = None
+
+        ee = self.ee
+        if ee is not None:
+            value = getattr(ee, 'contact_constraint', None)
+            if value is not None:
+                constraint_id = int(value)
+                try:
+                    state = np.asarray(
+                        p.getConstraintState(constraint_id),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    if state.size >= 3:
+                        suction_force[:] = state[:3]
+                        constraint_available = True
+                    if state.size >= 6:
+                        suction_torque[:] = state[3:6]
+                except Exception:
+                    constraint_available = False
+
+        grasp_active = bool(
+            ee is not None and getattr(ee, 'activated', False)
+        )
+        return {
+            'joint_motor_torque': [float(v) for v in joint_motor_torque],
+            'joint_motor_torque_norm': float(np.linalg.norm(joint_motor_torque)),
+            'suction_force_xyz': [float(v) for v in suction_force],
+            'suction_force_norm': float(np.linalg.norm(suction_force)),
+            'suction_torque_xyz': [float(v) for v in suction_torque],
+            'suction_torque_norm': float(np.linalg.norm(suction_torque)),
+            'grasp_active': int(grasp_active),
+            'constraint_available': int(constraint_available),
+            'constraint_id': constraint_id,
+        }
+
     def is_static(self):
         """Checks if env is static, used for checking if action finished.
 
@@ -317,6 +369,8 @@ class Environment():
 
         id_plane = p.loadURDF('assets/plane/plane.urdf', [0, 0, -0.001])
         id_ws = p.loadURDF('assets/ur5/workspace.urdf', [0.5, 0, 0])
+        self.plane_id = int(id_plane)
+        self.workspace_id = int(id_ws)
 
         # Load UR5 robot arm equipped with task-specific end effector.
         self.ur5 = p.loadURDF(f'assets/ur5/ur5-{self.task.ee}.urdf')
@@ -952,6 +1006,131 @@ class Environment():
         return_pose[2] = final_z
         success &= self.movep(return_pose)
         self._ccda_record_frame('probe_settle')
+        return bool(success)
+
+    def pick_planar_microprobe(
+            self,
+            pose0,
+            pose_probe,
+            pose_return,
+            lift_height=0.0015,
+            hold_steps=60,
+            return_hold_steps=120,
+            post_release_steps=120,
+            approach_height=0.02,
+            retreat_z=0.3):
+        """Low-height planar probe with one continuous grasp."""
+        if not self.deterministic:
+            raise RuntimeError(
+                'pick_planar_microprobe requires deterministic execution'
+            )
+
+        lift_height = float(lift_height)
+        approach_height = float(approach_height)
+        retreat_z = float(retreat_z)
+        hold_steps = int(hold_steps)
+        return_hold_steps = int(return_hold_steps)
+        post_release_steps = int(post_release_steps)
+
+        if lift_height <= 0:
+            raise ValueError('lift_height must be positive')
+        if approach_height <= lift_height:
+            raise ValueError('approach_height must exceed lift_height')
+        if retreat_z <= 0:
+            raise ValueError('retreat_z must be positive')
+        if min(hold_steps, return_hold_steps, post_release_steps) < 0:
+            raise ValueError('microprobe step counts must be non-negative')
+
+        speed = 0.001
+        delta_z = -0.0005
+        if hasattr(self.task, 'primitive_params'):
+            params = self.task.primitive_params[self.task.task_stage]
+            speed = float(params.get('speed', speed))
+            delta_z = float(params.get('delta_z', delta_z))
+        if delta_z >= 0:
+            raise ValueError('microprobe delta_z must be negative')
+
+        deformable_ids = getattr(self.task, 'def_IDs', [])
+        pick_position = np.asarray(pose0[0], dtype=np.float64)
+        pick_rotation = np.asarray(pose0[1], dtype=np.float64)
+        probe_position = np.asarray(pose_probe[0], dtype=np.float64)
+        return_position = np.asarray(pose_return[0], dtype=np.float64)
+
+        success = True
+        approach_pose = np.hstack((
+            [pick_position[0], pick_position[1], pick_position[2] + approach_height],
+            pick_rotation,
+        ))
+        self._ccda_record_frame('micro_approach')
+        success &= self.movep(approach_pose, speed=speed)
+
+        target_pose = approach_pose.copy()
+        floor_limit = max(0.0, float(pick_position[2]) - 0.01)
+        self._ccda_record_frame('micro_lower')
+        while not self.ee.detect_contact(deformable_ids) and target_pose[2] > floor_limit:
+            target_pose[2] += delta_z
+            success &= self.movep(target_pose, speed=speed)
+            if not success:
+                return False
+
+        self._ccda_record_frame('micro_grasp')
+        self.ee.activate(self.objects, deformable_ids)
+        if not self.ee.check_grasp():
+            self.ee.release()
+            retreat_pose = approach_pose.copy()
+            retreat_pose[2] = retreat_z
+            self.movep(retreat_pose, speed=speed)
+            return False
+
+        current_tip = p.getLinkState(
+            self.ur5,
+            self.ee_tip_link,
+            computeForwardKinematics=True,
+        )[0]
+        probe_z = float(current_tip[2]) + lift_height
+
+        lift_pose = np.hstack((
+            [pick_position[0], pick_position[1], probe_z],
+            pick_rotation,
+        ))
+        self._ccda_record_frame('micro_lift')
+        success &= self.movep(lift_pose, speed=speed)
+
+        outward_pose = np.hstack((
+            [probe_position[0], probe_position[1], probe_z],
+            pick_rotation,
+        ))
+        self._ccda_record_frame('micro_probe_out')
+        success &= self.movep(outward_pose, speed=speed)
+        if hold_steps:
+            self._ccda_record_frame('micro_probe_hold')
+            self.step_physics(hold_steps)
+
+        return_pose = np.hstack((
+            [return_position[0], return_position[1], probe_z],
+            pick_rotation,
+        ))
+        self._ccda_record_frame('micro_probe_return')
+        success &= self.movep(return_pose, speed=speed)
+        if return_hold_steps:
+            self._ccda_record_frame('micro_return_hold')
+            self.step_physics(return_hold_steps)
+
+        release_pose = return_pose.copy()
+        release_pose[2] = float(pick_position[2])
+        self._ccda_record_frame('micro_return_lower')
+        success &= self.movep(release_pose, speed=speed)
+        self._ccda_record_frame('micro_release')
+        self.ee.release()
+        if post_release_steps:
+            self._ccda_record_frame('micro_post_release')
+            self.step_physics(post_release_steps)
+
+        retreat_pose = release_pose.copy()
+        retreat_pose[2] = retreat_z
+        self._ccda_record_frame('micro_retreat')
+        success &= self.movep(retreat_pose, speed=speed)
+        self._ccda_record_frame('micro_done')
         return bool(success)
 
     def sweep(self, pose0, pose1):

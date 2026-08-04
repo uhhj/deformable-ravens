@@ -11,13 +11,15 @@ import pybullet as p
 from ravens.tasks.ccda_hidden_friction import (
     HiddenFrictionConfig,
     HiddenPlanarFrictionPatch,
+    NativeSegmentFrictionConfig,
 )
 from ravens.tasks.defs_cables import CableLineNoTarget
 
 
 class CCDAHiddenFrictionCable(CableLineNoTarget):
     CONDITIONS = ("free", "hidden_high_friction")
-    ENVIRONMENT_VERSION = "ccda_hidden_friction_cable_v1"
+    FRICTION_MECHANISMS = ("external_patch", "native_segment")
+    ENVIRONMENT_VERSION = "ccda_hidden_friction_cable_v2"
     VALID_PHASES = ("no_action", "preload", "main_pull", "post_main")
 
     def __init__(self):
@@ -54,7 +56,9 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         self._trace_stride = 4
         self._hidden_friction_pending = True
         self._hidden_friction_armed = False
+        self._friction_mechanism = "external_patch"
         self._friction_model = None
+        self._native_config = None
         self._patch_center_xy = np.zeros(2, dtype=np.float64)
         self._selected_local_indices: List[int] = []
         self._selected_bead_ids: List[int] = []
@@ -78,11 +82,14 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         self.hidden_condition = os.environ.get("CCDA_HIDDEN_CONDITION", "free")
         self.ccda_visible_seed = os.environ.get("CCDA_VISIBLE_SEED", "")
         self.ccda_pair_group = os.environ.get("CCDA_PAIR_GROUP", "")
+        self._friction_mechanism = os.environ.get(
+            "CCDA_FRICTION_MECHANISM",
+            "external_patch",
+        )
         if self.hidden_condition not in self.CONDITIONS:
-            raise ValueError(
-                f"unknown hidden condition {self.hidden_condition!r}; "
-                f"expected one of {self.CONDITIONS}"
-            )
+            raise ValueError(f"unknown hidden condition {self.hidden_condition!r}")
+        if self._friction_mechanism not in self.FRICTION_MECHANISMS:
+            raise ValueError(f"unknown friction mechanism {self._friction_mechanism!r}")
         self._trace_stride = self._env_int("CCDA_TRACE_STRIDE", "4")
         if self._trace_stride <= 0:
             raise ValueError("CCDA_TRACE_STRIDE must be positive")
@@ -103,7 +110,7 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
             dtype=np.float64,
         )
 
-    def _friction_config(self) -> HiddenFrictionConfig:
+    def _external_config(self) -> HiddenFrictionConfig:
         return HiddenFrictionConfig(
             patch_radius=self._env_float("CCDA_FRICTION_PATCH_RADIUS", "0.045"),
             viscous_gain=self._env_float("CCDA_FRICTION_VISCOUS_GAIN", "1.5"),
@@ -113,32 +120,94 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
             contact_height=self._env_float("CCDA_FRICTION_CONTACT_HEIGHT", "0.03"),
         )
 
+    def _native_segment_config(self) -> NativeSegmentFrictionConfig:
+        return NativeSegmentFrictionConfig(
+            base_lateral_friction=self._env_float(
+                "CCDA_NATIVE_BASE_LATERAL_FRICTION", "0.15"
+            ),
+            hidden_lateral_friction=self._env_float(
+                "CCDA_NATIVE_HIDDEN_LATERAL_FRICTION", "1.2"
+            ),
+            spinning_friction=self._env_float(
+                "CCDA_NATIVE_SPINNING_FRICTION", "0.0"
+            ),
+            rolling_friction=self._env_float(
+                "CCDA_NATIVE_ROLLING_FRICTION", "0.0"
+            ),
+            restitution=self._env_float("CCDA_NATIVE_RESTITUTION", "0.0"),
+        )
+
+    def _select_hidden_segment(self, positions: np.ndarray) -> None:
+        ratio = self._env_float("CCDA_FRICTION_CENTER_RATIO", "0.45")
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError("CCDA_FRICTION_CENTER_RATIO must lie in [0, 1]")
+        selected_count = self._env_int("CCDA_FRICTION_SELECTED_COUNT", "5")
+        if selected_count <= 0 or selected_count % 2 != 1:
+            raise ValueError("CCDA_FRICTION_SELECTED_COUNT must be positive odd")
+        if selected_count > positions.shape[0]:
+            raise ValueError("CCDA_FRICTION_SELECTED_COUNT exceeds bead count")
+
+        center_index = int(np.clip(
+            round(ratio * (positions.shape[0] - 1)),
+            0,
+            positions.shape[0] - 1,
+        ))
+        start = int(np.clip(
+            center_index - selected_count // 2,
+            0,
+            positions.shape[0] - selected_count,
+        ))
+        self._selected_local_indices = list(range(start, start + selected_count))
+        self._selected_bead_ids = [
+            int(self.cable_bead_IDs[index])
+            for index in self._selected_local_indices
+        ]
+        self._patch_center_xy = np.mean(
+            positions[self._selected_local_indices, :2], axis=0
+        )
+
+    def _apply_native_segment_dynamics(self) -> None:
+        if self._native_config is None:
+            raise RuntimeError("native friction config is missing")
+        config = self._native_config
+        for bead_id in self.cable_bead_IDs:
+            p.changeDynamics(
+                int(bead_id), -1,
+                lateralFriction=float(config.base_lateral_friction),
+                spinningFriction=float(config.spinning_friction),
+                rollingFriction=float(config.rolling_friction),
+                restitution=float(config.restitution),
+            )
+        if self.hidden_condition == "hidden_high_friction":
+            for bead_id in self._selected_bead_ids:
+                p.changeDynamics(
+                    int(bead_id), -1,
+                    lateralFriction=float(config.hidden_lateral_friction),
+                    spinningFriction=float(config.spinning_friction),
+                    rollingFriction=float(config.rolling_friction),
+                    restitution=float(config.restitution),
+                )
+
     def arm_hidden_friction_after_settle(self) -> Dict[str, Any]:
         if self._hidden_friction_armed:
             return {"already_armed": True}
         before = self._ordered_bead_positions()
         if before.shape[0] == 0:
             raise RuntimeError("cannot arm hidden friction without cable beads")
-        ratio = self._env_float("CCDA_FRICTION_CENTER_RATIO", "0.45")
-        if not 0.0 <= ratio <= 1.0:
-            raise ValueError("CCDA_FRICTION_CENTER_RATIO must lie in [0, 1]")
-        selected_count = self._env_int("CCDA_FRICTION_SELECTED_COUNT", "5")
-        if selected_count <= 0 or selected_count % 2 != 1:
-            raise ValueError("CCDA_FRICTION_SELECTED_COUNT must be a positive odd integer")
-        if selected_count > before.shape[0]:
-            raise ValueError("CCDA_FRICTION_SELECTED_COUNT exceeds bead count")
-
-        center_index = int(np.clip(round(ratio * (before.shape[0] - 1)), 0, before.shape[0] - 1))
-        start = center_index - selected_count // 2
-        start = int(np.clip(start, 0, before.shape[0] - selected_count))
-        self._selected_local_indices = list(range(start, start + selected_count))
-        self._selected_bead_ids = [int(self.cable_bead_IDs[index]) for index in self._selected_local_indices]
-        self._patch_center_xy = np.mean(before[self._selected_local_indices, :2], axis=0)
-        self._friction_model = HiddenPlanarFrictionPatch(
-            config=self._friction_config(),
-            center_xy=self._patch_center_xy,
-            enabled=self.hidden_condition == "hidden_high_friction",
-        )
+        self._select_hidden_segment(before)
+        self._friction_model = None
+        self._native_config = None
+        if self._friction_mechanism == "external_patch":
+            self._friction_model = HiddenPlanarFrictionPatch(
+                config=self._external_config(),
+                center_xy=self._patch_center_xy,
+                enabled=self.hidden_condition == "hidden_high_friction",
+            )
+        elif self._friction_mechanism == "native_segment":
+            self._native_config = self._native_segment_config()
+            self._apply_native_segment_dynamics()
+        else:
+            raise RuntimeError(f"unsupported mechanism {self._friction_mechanism}")
         after = self._ordered_bead_positions()
         jump = np.abs(after - before)
         self._arm_max_abs_jump = float(np.max(jump)) if jump.size else 0.0
@@ -148,6 +217,7 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         self._last_contact = self._zero_contact()
         return {
             "already_armed": False,
+            "friction_mechanism": self._friction_mechanism,
             "arm_max_abs_jump": self._arm_max_abs_jump,
             "arm_mae_jump": self._arm_mae_jump,
         }
@@ -170,6 +240,7 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         self._hidden_friction_pending = True
         self._hidden_friction_armed = False
         self._friction_model = None
+        self._native_config = None
         self._patch_center_xy = np.zeros(2, dtype=np.float64)
         self._selected_local_indices = []
         self._selected_bead_ids = []
@@ -186,8 +257,10 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         self._last_contact = self._zero_contact()
         if not self._hidden_friction_armed:
             return
+        if self._friction_mechanism == "native_segment":
+            return
         if self._friction_model is None:
-            raise RuntimeError("armed hidden-friction task has no friction model")
+            raise RuntimeError("external-patch task has no friction model")
 
         sum_force = np.zeros(3, dtype=np.float64)
         force_norms = []
@@ -221,7 +294,44 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         if self.hidden_condition == "free" and any(
             value != 0.0 for value in self._last_contact["force_xyz"]
         ):
-            raise RuntimeError("free condition produced non-zero hidden force")
+            raise RuntimeError("free external-patch condition produced force")
+
+    def _native_contact_observation(self) -> Dict[str, Any]:
+        if self._env is None or self._env.plane_id is None:
+            return self._zero_contact()
+        sum_force = np.zeros(3, dtype=np.float64)
+        force_norms = []
+        speeds = []
+        active_beads = 0
+        for bead_id in self._selected_bead_ids:
+            bead_force = np.zeros(3, dtype=np.float64)
+            points = p.getContactPoints(
+                bodyA=int(bead_id), bodyB=int(self._env.plane_id)
+            )
+            for point in points:
+                if len(point) >= 14:
+                    lateral_1 = float(point[10])
+                    direction_1 = np.asarray(point[11], dtype=np.float64)
+                    lateral_2 = float(point[12])
+                    direction_2 = np.asarray(point[13], dtype=np.float64)
+                    bead_force += (
+                        lateral_1 * direction_1
+                        + lateral_2 * direction_2
+                    )
+            planar_norm = float(np.linalg.norm(bead_force[:2]))
+            if planar_norm > 0.0:
+                active_beads += 1
+            sum_force += bead_force
+            force_norms.append(planar_norm)
+            velocity = p.getBaseVelocity(int(bead_id))[0]
+            speeds.append(float(np.linalg.norm(np.asarray(velocity[:2]))))
+        return {
+            "force_xyz": [float(v) for v in sum_force],
+            "force_norm": float(np.sum(force_norms)),
+            "max_force_norm": float(np.max(force_norms)) if force_norms else 0.0,
+            "active_beads": int(active_beads),
+            "mean_speed": float(np.mean(speeds)) if speeds else 0.0,
+        }
 
     def _robot_state(self) -> Dict[str, Any]:
         if self._env is None:
@@ -232,7 +342,11 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
                 "ee_orientation": [0.0, 0.0, 0.0, 1.0],
             }
         states = [p.getJointState(self._env.ur5, int(joint)) for joint in self._env.joints]
-        ee_state = p.getLinkState(self._env.ur5, self._env.ee_tip_link)
+        ee_state = p.getLinkState(
+            self._env.ur5,
+            self._env.ee_tip_link,
+            computeForwardKinematics=True,
+        )
         return {
             "joint_positions": [float(state[0]) for state in states],
             "joint_velocities": [float(state[1]) for state in states],
@@ -242,6 +356,10 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
 
     def physics_step_hook(self) -> None:
         self._physics_step_count += 1
+        if (
+                self._hidden_friction_armed
+                and self._friction_mechanism == "native_segment"):
+            self._last_contact = self._native_contact_observation()
         if not self._hidden_friction_armed or self._physics_step_count % self._trace_stride != 0:
             return
         positions = self._ordered_bead_positions()
@@ -250,7 +368,8 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
             dtype=np.float64,
         )
         robot = self._robot_state()
-        contact = self.ccda_contact_observation()
+        oracle = self.ccda_contact_observation()
+        sensor = self.ccda_sensor_observation()
         self._trace.append(
             {
                 "physics_step": int(self._physics_step_count),
@@ -261,11 +380,19 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
                 "joint_velocities": robot["joint_velocities"],
                 "ee_position": robot["ee_position"],
                 "ee_orientation": robot["ee_orientation"],
-                "contact_force_xyz": contact["force_xyz"],
-                "contact_force_norm": contact["force_norm"],
-                "contact_max_force_norm": contact["max_force_norm"],
-                "contact_active_beads": contact["active_beads"],
-                "contact_mean_speed": contact["mean_speed"],
+                "contact_force_xyz": oracle["force_xyz"],
+                "contact_force_norm": oracle["force_norm"],
+                "contact_max_force_norm": oracle["max_force_norm"],
+                "contact_active_beads": oracle["active_beads"],
+                "contact_mean_speed": oracle["mean_speed"],
+                "sensor_joint_motor_torque": sensor["joint_motor_torque"],
+                "sensor_joint_motor_torque_norm": sensor["joint_motor_torque_norm"],
+                "sensor_suction_force_xyz": sensor["suction_force_xyz"],
+                "sensor_suction_force_norm": sensor["suction_force_norm"],
+                "sensor_suction_torque_xyz": sensor["suction_torque_xyz"],
+                "sensor_suction_torque_norm": sensor["suction_torque_norm"],
+                "sensor_grasp_active": sensor["grasp_active"],
+                "sensor_constraint_available": sensor["constraint_available"],
             }
         )
 
@@ -284,18 +411,30 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         return int(self._physics_step_count)
 
     def ccda_contact_observation(self) -> Dict[str, Any]:
+        """Privileged/Oracle hidden-contact observation."""
         return copy.deepcopy(self._last_contact)
 
+    def ccda_sensor_observation(self) -> Dict[str, Any]:
+        """Robot-observable contact proxy."""
+        return self._env.ccda_sensor_observation()
+
     def ccda_privileged_state(self) -> Dict[str, Any]:
-        if self._friction_model is None:
-            raise RuntimeError("hidden friction has not been armed")
+        if self._friction_mechanism == "external_patch":
+            if self._friction_model is None:
+                raise RuntimeError("external friction has not been armed")
+            mechanism_state = self._friction_model.snapshot()
+        else:
+            if self._native_config is None:
+                raise RuntimeError("native friction has not been armed")
+            mechanism_state = self._native_config.snapshot()
         return {
             "environment_version": self.ENVIRONMENT_VERSION,
             "hidden_condition": self.hidden_condition,
+            "friction_mechanism": self._friction_mechanism,
             "patch_center_xy": [float(value) for value in self._patch_center_xy],
             "selected_local_indices": list(self._selected_local_indices),
             "selected_bead_ids": list(self._selected_bead_ids),
-            "friction_model": self._friction_model.snapshot(),
+            "mechanism_state": mechanism_state,
             "arm_max_abs_jump": float(self._arm_max_abs_jump),
             "arm_mae_jump": float(self._arm_mae_jump),
             "visible_seed": self.ccda_visible_seed,
@@ -307,5 +446,6 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
         extras["ccda_environment_version"] = self.ENVIRONMENT_VERSION
         extras["ccda_phase"] = self._phase
         extras["ccda_physics_step"] = self._physics_step_count
-        extras["ccda_contact_observation"] = self.ccda_contact_observation()
+        extras["ccda_oracle_contact"] = self.ccda_contact_observation()
+        extras["ccda_sensor_observation"] = self.ccda_sensor_observation()
         return reward, extras
