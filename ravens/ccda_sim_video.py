@@ -206,9 +206,9 @@ class CCDASimulationVideoRecorder:
                 f"phase={phase} | motion={label or 'sample'} | physics_step={physics_step}",
                 (
                     f"contact_force_sum={contact['force_norm']:.5f} N | "
-                    f"max_bead_force={contact['max_force_norm']:.5f} N | "
-                    f"active_beads={contact['active_beads']}"
+                    f"max_bead_force={contact['max_force_norm']:.5f} N"
                 ),
+                f"active_beads={contact['active_beads']}",
             ]
             frame = draw_status_overlay(frame, lines)
 
