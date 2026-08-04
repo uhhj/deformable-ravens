@@ -141,6 +141,30 @@ class Environment():
     def pause(self):
         self.running = False
 
+    def reset_ccda_runtime_after_restore(self):
+        """Reset Python-side fields after ``pybullet.restoreState``."""
+        self._ccda_physics_hook_error = None
+        self._ccda_video_label = ""
+
+        ee = self.ee
+        if ee is None:
+            return
+
+        defaults = {
+            "activated": False,
+            "contact_constraint": None,
+            "def_grip_item": None,
+            "def_grip_anchors": None,
+            "def_min_vertex": None,
+            "def_min_vetex": None,
+            "def_min_distance": None,
+            "init_grip_distance": None,
+            "init_grip_item": None,
+        }
+        for name, value in defaults.items():
+            if hasattr(ee, name):
+                setattr(ee, name, value)
+
     def set_ccda_video_recorder(self, recorder):
         """Attach or detach an optional CCDA simulation video recorder."""
         self._ccda_video_recorder = recorder
@@ -303,7 +327,13 @@ class Environment():
         if disable_render_load:
             p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
         (obs, _, _, _) = self.step()
-        if isinstance(self.task, tasks.names['ccda-hidden-friction-cable']):
+        defer_hidden_friction = (
+            os.environ.get('CCDA_DEFER_HIDDEN_FRICTION_ARMING', '0') == '1'
+        )
+        if (
+            isinstance(self.task, tasks.names['ccda-hidden-friction-cable'])
+            and not defer_hidden_friction
+        ):
             # Arm only after the visible force-free geometry has settled.
             self.pause()
             self.task.arm_hidden_friction_after_settle()

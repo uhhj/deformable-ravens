@@ -152,6 +152,36 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
             "arm_mae_jump": self._arm_mae_jump,
         }
 
+    def ccda_is_armed(self) -> bool:
+        return bool(self._hidden_friction_armed)
+
+    def reset_ccda_branch(self, condition: str) -> None:
+        """Reset branch-local Python state after the world is restored."""
+        if condition not in self.CONDITIONS:
+            raise ValueError(
+                f"unknown hidden condition {condition!r}; "
+                f"expected one of {self.CONDITIONS}"
+            )
+
+        self.hidden_condition = str(condition)
+        self._physics_step_count = 0
+        self._phase = "no_action"
+        self._trace = []
+        self._hidden_friction_pending = True
+        self._hidden_friction_armed = False
+        self._friction_model = None
+        self._patch_center_xy = np.zeros(2, dtype=np.float64)
+        self._selected_local_indices = []
+        self._selected_bead_ids = []
+        self._arm_max_abs_jump = 0.0
+        self._arm_mae_jump = 0.0
+        self._last_contact = self._zero_contact()
+
+        self.total_rewards = 0
+        self.exit_gracefully = False
+        self.t = 0
+        self.task_stage = 1
+
     def physics_pre_step_hook(self) -> None:
         self._last_contact = self._zero_contact()
         if not self._hidden_friction_armed:
