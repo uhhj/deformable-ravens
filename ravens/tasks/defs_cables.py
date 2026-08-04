@@ -548,9 +548,7 @@ class CableShape(CableEnv):
 
         if self._debug:
             self.debug()
-        env.start()
-        time.sleep(self._settle_secs)
-        env.pause()
+        env.settle_for_seconds(self._settle_secs)
 
 
 class CableShapeNoTarget(CableShape):

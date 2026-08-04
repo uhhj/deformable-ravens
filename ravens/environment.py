@@ -17,7 +17,13 @@ from ravens import tasks, utils
 
 class Environment():
 
-    def __init__(self, disp=False, hz=240):
+    def __init__(
+            self,
+            disp=False,
+            hz=240,
+            deterministic=False,
+            control_substeps=1,
+            post_action_settle_steps=240):
         """Creates OpenAI gym-style env with support for PyBullet threading.
 
         Args:
@@ -57,6 +63,13 @@ class Environment():
         # From Xuchen: need this for using any new deformable simulation.
         self.use_new_deformable = True
         self.hz = hz
+        self.deterministic = bool(deterministic)
+        self.control_substeps = int(control_substeps)
+        self.post_action_settle_steps = int(post_action_settle_steps)
+        if self.control_substeps <= 0:
+            raise ValueError('control_substeps must be positive')
+        if self.post_action_settle_steps < 0:
+            raise ValueError('post_action_settle_steps must be non-negative')
 
         # Start PyBullet.
         p.connect(p.GUI if disp else p.DIRECT)
@@ -64,6 +77,9 @@ class Environment():
         p.setPhysicsEngineParameter(enableFileCaching=0)
         assets_path = os.path.dirname(os.path.abspath(__file__))
         p.setAdditionalSearchPath(assets_path)
+        # Fixed-step mode has no background thread, so the time step must be
+        # installed before any explicit physics step is executed.
+        p.setTimeStep(1.0 / self.hz)
 
         # Check PyBullet version (see also the cloth/bag task scripts!).
         p_version = pkg_resources.get_distribution('pybullet').version
@@ -81,55 +97,97 @@ class Environment():
                 cameraTargetPosition=target,)
 
         # Control PyBullet simulation steps.
-        self.step_thread = threading.Thread(target=self.step_simulation)
-        self.step_thread.daemon = True
-        self.step_thread.start()
+        self.step_thread = None
+        if not self.deterministic:
+            self.step_thread = threading.Thread(target=self.step_simulation)
+            self.step_thread.daemon = True
+            self.step_thread.start()
+
+    def _step_physics_once_unlocked(self):
+        """Execute exactly one PyBullet step and the CCDA task hooks."""
+        task = getattr(self, 'task', None)
+        pre_hook = getattr(task, 'physics_pre_step_hook', None)
+        if callable(pre_hook):
+            try:
+                pre_hook()
+            except Exception as exc:
+                if self._ccda_physics_hook_error is None:
+                    self._ccda_physics_hook_error = (
+                        'physics_pre_step_hook: ' + repr(exc)
+                    )
+
+        p.stepSimulation()
+        if self.ee is not None:
+            self.ee.step()
+
+        post_hook = getattr(task, 'physics_step_hook', None)
+        if callable(post_hook):
+            try:
+                post_hook()
+            except Exception as exc:
+                if self._ccda_physics_hook_error is None:
+                    self._ccda_physics_hook_error = (
+                        'physics_step_hook: ' + repr(exc)
+                    )
+
+    def _raise_ccda_physics_hook_error(self):
+        if self._ccda_physics_hook_error is not None:
+            raise RuntimeError(self._ccda_physics_hook_error)
+
+    def step_physics(self, steps=1):
+        """Advance an exact number of physics steps.
+
+        This is the only physics driver used by deterministic CCDA rollouts.
+        In threaded mode it may be used only while the background loop is
+        paused, preventing two independent callers from advancing PyBullet.
+        """
+        steps = int(steps)
+        if steps < 0:
+            raise ValueError('steps must be non-negative')
+        if not self.deterministic and self.running:
+            raise RuntimeError(
+                'step_physics requires the threaded environment to be paused'
+            )
+        with self._ccda_step_lock:
+            for _ in range(steps):
+                self._step_physics_once_unlocked()
+                self._raise_ccda_physics_hook_error()
+
+    def wait_seconds(self, seconds):
+        """Wait in threaded mode or advance an exact duration in fixed-step mode."""
+        seconds = float(seconds)
+        if seconds < 0:
+            raise ValueError('seconds must be non-negative')
+        if self.deterministic:
+            self.step_physics(int(round(seconds * self.hz)))
+        else:
+            time.sleep(seconds)
+
+    def settle_for_seconds(self, seconds):
+        """Settle a task for a deterministic or wall-clock duration."""
+        seconds = float(seconds)
+        if seconds < 0:
+            raise ValueError('seconds must be non-negative')
+        if self.deterministic:
+            self.step_physics(int(round(seconds * self.hz)))
+        else:
+            self.start()
+            time.sleep(seconds)
+            self.pause()
 
     def step_simulation(self):
-        """Adding optional hertz parameter for better cloth physics.
-
-        From our discussion with Erwin, we should just set time.sleep(0.001),
-        or even consider removing it all together. It's mainly for us to
-        visualize PyBullet with the GUI to make it not move too fast
-        """
+        """Background physics loop used by the legacy threaded mode."""
         p.setTimeStep(1.0 / self.hz)
         while not self._stop_event.is_set():
             if self.running:
                 with self._ccda_step_lock:
-                    # PHASE3_12D_R24_SLACK_BREAKAWAY_V2: forces must be applied before the PyBullet
-                    # step in which they are intended to act.
-                    task = getattr(self, 'task', None)
-                    pre_hook = getattr(task, 'physics_pre_step_hook', None)
-                    if callable(pre_hook):
-                        try:
-                            pre_hook()
-                        except Exception as exc:
-                            if self._ccda_physics_hook_error is None:
-                                self._ccda_physics_hook_error = (
-                                    "physics_pre_step_hook: " + repr(exc)
-                                )
-
-                    p.stepSimulation()
-                    if self.ee is not None:
-                        self.ee.step()
-
-                    hook = getattr(task, 'physics_step_hook', None)
-                    if callable(hook):
-                        try:
-                            hook()
-                        except Exception as exc:
-                            # Do not let an exception silently terminate the daemon
-                            # thread. The rollout wrapper treats this as a hard error.
-                            if self._ccda_physics_hook_error is None:
-                                self._ccda_physics_hook_error = (
-                                    "physics_step_hook: " + repr(exc)
-                                )
+                    self._step_physics_once_unlocked()
             time.sleep(0.001)
 
     def stop(self):
         self.running = False
         self._stop_event.set()
-        if self.step_thread.is_alive():
+        if self.step_thread is not None and self.step_thread.is_alive():
             self.step_thread.join(timeout=1.0)
         with self._ccda_step_lock:
             if p.isConnected():
@@ -359,7 +417,8 @@ class Environment():
         with ground truth agents, there is no 'second action lacking a primitive',
         because ground truth agents don't need images (see their `act` method).
         """
-        if act and act['primitive']:
+        action_executed = bool(act and act['primitive'])
+        if action_executed:
             success = self.primitives[act['primitive']](**act['params'])
 
             # Exit early if action failed. Daniel: adding exit_gracefully.
@@ -384,13 +443,19 @@ class Environment():
                 info['extras'] = reward_extras
                 return {}, 0, True, info
 
-        # Wait for objects to settle, with a hard exit for bag tasks.
-        start_t = time.time()
-        while not self.is_static():
-            self._ccda_record_frame("settle")
-            if self.is_bag_env() and (time.time() - start_t > 2.0):
-                break
-            time.sleep(0.001)
+        if self.deterministic:
+            # Do not wait on a velocity predicate: hidden contact conditions
+            # can reach that predicate at different times. A fixed number of
+            # post-action steps gives repeatable phase boundaries.
+            if action_executed and self.post_action_settle_steps:
+                self.step_physics(self.post_action_settle_steps)
+        else:
+            start_t = time.time()
+            while not self.is_static():
+                self._ccda_record_frame("settle")
+                if self.is_bag_env() and (time.time() - start_t > 2.0):
+                    break
+                time.sleep(0.001)
 
         # Compute task rewards.
         reward, reward_extras = self.task.reward()
@@ -541,8 +606,50 @@ class Environment():
     # Robot Movement Functions
     #-------------------------------------------------------------------------
 
+    def _movej_fixed(self, targj, speed=0.01, t_lim=20):
+        """Move joints with one deterministic control update per fixed step."""
+        targj = np.asarray(targj, dtype=np.float64)
+        speed = float(speed)
+        if speed <= 0:
+            raise ValueError('movej speed must be positive')
+
+        max_physics_steps = max(1, int(round(float(t_lim) * self.hz)))
+        max_iterations = max(
+            1,
+            int(np.ceil(max_physics_steps / self.control_substeps)),
+        )
+        for _ in range(max_iterations):
+            currj = np.asarray(
+                [p.getJointState(self.ur5, i)[0] for i in self.joints],
+                dtype=np.float64,
+            )
+            diffj = targj - currj
+            if np.all(np.abs(diffj) < 1e-2):
+                return True
+
+            norm = float(np.linalg.norm(diffj))
+            velocity = diffj / norm if norm > 0 else np.zeros_like(diffj)
+            stepj = currj + velocity * speed
+            p.setJointMotorControlArray(
+                bodyIndex=self.ur5,
+                jointIndices=self.joints,
+                controlMode=p.POSITION_CONTROL,
+                targetPositions=stepj,
+                positionGains=np.ones(len(self.joints)),
+            )
+            self._ccda_record_frame('movej')
+            self.step_physics(self.control_substeps)
+
+        print(
+            'Warning: deterministic movej exceeded {} physics steps. '
+            'Skipping.'.format(max_physics_steps)
+        )
+        return False
+
     def movej(self, targj, speed=0.01, t_lim=20):
         """Move UR5 to target joint configuration."""
+        if self.deterministic:
+            return self._movej_fixed(targj, speed=speed, t_lim=t_lim)
         t0 = time.time()
         while (time.time() - t0) < t_lim:
             currj = [p.getJointState(self.ur5, i)[0] for i in self.joints]
@@ -689,7 +796,7 @@ class Environment():
         if self.is_softbody_env() or self.is_new_cable_env():
             prepick_pose[2] = postpick_z
             success &= self.movep(prepick_pose, speed=speed)
-            time.sleep(pause_place) # extra rest for bags
+            self.wait_seconds(pause_place) # extra rest for bags
         elif isinstance(self.task, tasks.names['cable']):
             prepick_pose[2] = 0.03
             success &= self.movep(prepick_pose, speed=0.001)
@@ -710,7 +817,7 @@ class Environment():
             if self.is_softbody_env() or self.is_new_cable_env():
                 preplace_pose[2] = preplace_z
                 success &= self.movep(preplace_pose, speed=speed)
-                time.sleep(pause_place) # extra rest for bags
+                self.wait_seconds(pause_place) # extra rest for bags
             elif isinstance(self.task, tasks.names['cable']):
                 preplace_pose[2] = 0.03
                 success &= self.movep(preplace_pose, speed=0.001)
