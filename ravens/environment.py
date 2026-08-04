@@ -47,7 +47,8 @@ class Environment():
         self.homej = np.array([-1, -0.5, 0.5, -0.5, -0.5, 0]) * np.pi
         self.primitives = {'push':       self.push,
                            'sweep':      self.sweep,
-                           'pick_place': self.pick_place}
+                           'pick_place': self.pick_place,
+                           'pick_probe_return': self.pick_probe_return}
 
         self._ccda_video_recorder = None
         self._ccda_video_label = ""
@@ -846,6 +847,112 @@ class Environment():
             success &= self.movep(prepick_pose)
             self._ccda_record_frame("settle")
         return success
+
+    def pick_probe_return(
+            self,
+            pose0,
+            pose_probe,
+            pose_return,
+            hold_steps=0):
+        """Pick a cable endpoint, probe outward, return, then release.
+
+        This primitive is intended only for deterministic CCDA calibration. The
+        same grasp remains active during outward and return motion, avoiding a
+        condition-dependent re-grasp between the two waypoints.
+        """
+        if not self.deterministic:
+            raise RuntimeError(
+                'pick_probe_return requires deterministic fixed-step execution'
+            )
+
+        hold_steps = int(hold_steps)
+        if hold_steps < 0:
+            raise ValueError('hold_steps must be non-negative')
+
+        speed = 0.01
+        delta_z = -0.001
+        prepick_z = 0.3
+        postpick_z = 0.3
+        preplace_z = 0.3
+        final_z = 0.3
+
+        if hasattr(self.task, 'primitive_params'):
+            stage = self.task.task_stage
+            params = self.task.primitive_params[stage]
+            prepick_z = params.get('prepick_z', prepick_z)
+            speed = params['speed']
+            delta_z = params['delta_z']
+            postpick_z = params['postpick_z']
+            preplace_z = params['preplace_z']
+
+        deformable_ids = []
+        if hasattr(self.task, 'def_IDs'):
+            deformable_ids = self.task.def_IDs
+
+        success = True
+        pick_position = np.asarray(pose0[0], dtype=np.float64)
+        pick_rotation = np.asarray(pose0[1], dtype=np.float64)
+        prepick_position = pick_position.copy()
+        prepick_position[2] = prepick_z
+        prepick_pose = np.hstack((prepick_position, pick_rotation))
+
+        self._ccda_record_frame('probe_prepick')
+        success &= self.movep(prepick_pose)
+
+        target_pose = prepick_pose.copy()
+        delta = np.asarray([0, 0, delta_z, 0, 0, 0, 0], dtype=np.float64)
+        self._ccda_record_frame('probe_lower')
+        while (
+                not self.ee.detect_contact(deformable_ids)
+                and target_pose[2] > 0):
+            target_pose += delta
+            success &= self.movep(target_pose)
+
+        self._ccda_record_frame('probe_grasp')
+        self.ee.activate(self.objects, deformable_ids)
+
+        prepick_pose[2] = postpick_z
+        self._ccda_record_frame('probe_lift')
+        success &= self.movep(prepick_pose, speed=speed)
+        if not self.ee.check_grasp():
+            self.ee.release()
+            prepick_pose[2] = final_z
+            success &= self.movep(prepick_pose)
+            return False
+
+        def waypoint_pose(value):
+            position = np.asarray(value[0], dtype=np.float64).copy()
+            rotation = np.asarray(value[1], dtype=np.float64)
+            position[2] = preplace_z
+            return np.hstack((position, rotation))
+
+        probe_pose = waypoint_pose(pose_probe)
+        return_pose = waypoint_pose(pose_return)
+
+        self._ccda_record_frame('probe_out')
+        success &= self.movep(probe_pose, speed=speed)
+
+        if hold_steps:
+            self._ccda_record_frame('probe_hold')
+            self.step_physics(hold_steps)
+
+        self._ccda_record_frame('probe_return')
+        success &= self.movep(return_pose, speed=speed)
+
+        target_pose = return_pose.copy()
+        self._ccda_record_frame('probe_return_lower')
+        while (
+                not self.ee.detect_contact(deformable_ids)
+                and target_pose[2] > 0):
+            target_pose += delta
+            success &= self.movep(target_pose)
+
+        self._ccda_record_frame('probe_release')
+        self.ee.release()
+        return_pose[2] = final_z
+        success &= self.movep(return_pose)
+        self._ccda_record_frame('probe_settle')
+        return bool(success)
 
     def sweep(self, pose0, pose1):
         """Execute sweeping primitive."""
