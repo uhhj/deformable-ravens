@@ -11,6 +11,7 @@ from ravens.tasks.ccda_hidden_hook_cable import (
     CCDAHiddenHookCable,
 )
 from ravens.tasks.ccda_hidden_routing_gate_geometry import (
+    FIXED_CENTER_RATIO_PROBE_SELECTOR,
     WHOLE_CABLE_BARRIER_MODE,
     HiddenRoutingGateGeometryConfig,
     compute_hidden_routing_gate_layout,
@@ -41,6 +42,7 @@ class CCDAHiddenRoutingGateCable(
         self._target_zone_visual_shape_index = (
             None
         )
+        self._selected_probe_index = None
 
     def _routing_config(self):
         return HiddenRoutingGateGeometryConfig(
@@ -132,6 +134,17 @@ class CCDAHiddenRoutingGateCable(
                     "0.45",
                 ),
             ),
+            probe_selector_mode=os.environ.get(
+                "CCDA_ROUTING_PROBE_SELECTOR_MODE",
+                FIXED_CENTER_RATIO_PROBE_SELECTOR,
+            ),
+            probe_index_override=(
+                -1
+                if self._selected_probe_index is None
+                else int(
+                    self._selected_probe_index
+                )
+            ),
             topology_id=os.environ.get(
                 "CCDA_ROUTING_TOPOLOGY_ID",
                 "hidden_routing_gate_v1",
@@ -208,6 +221,46 @@ class CCDAHiddenRoutingGateCable(
         ))
         return layout
 
+    def arm_ccda_hidden_factor_after_settle(
+        self,
+    ):
+        if (
+            not self._hidden_friction_armed
+            and self._selected_probe_index
+            is None
+        ):
+            positions = (
+                self._ordered_bead_positions()
+            )
+            layout = (
+                compute_hidden_routing_gate_layout(
+                    positions,
+                    self._routing_config(),
+                )
+            )
+            self._selected_probe_index = int(
+                layout["probe_index"]
+            )
+
+        if (
+            self._selected_probe_index
+            is not None
+        ):
+            os.environ[
+                "CCDA_ROUTING_SELECTED_PROBE_INDEX"
+            ] = str(
+                self._selected_probe_index
+            )
+
+        result = (
+            super()
+            .arm_ccda_hidden_factor_after_settle()
+        )
+        result["selected_probe_index"] = (
+            self._selected_probe_index
+        )
+        return result
+
     def _create_visible_target_zone(self):
         public = public_routing_layout(
             self._hook_layout
@@ -272,6 +325,11 @@ class CCDAHiddenRoutingGateCable(
         self._target_zone_visual_shape_index = (
             None
         )
+        self._selected_probe_index = None
+        os.environ.pop(
+            "CCDA_ROUTING_SELECTED_PROBE_INDEX",
+            None,
+        )
         super().reset(
             env,
             last_info=last_info,
@@ -327,6 +385,9 @@ class CCDAHiddenRoutingGateCable(
             ),
             "routing_gate_layout_privileged": (
                 layout
+            ),
+            "selected_probe_index": (
+                self._selected_probe_index
             ),
             "routing_gate_body_ids": state.pop(
                 "hook_body_ids"

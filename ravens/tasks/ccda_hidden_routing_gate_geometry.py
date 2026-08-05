@@ -18,6 +18,16 @@ BARRIER_MODES = (
     WHOLE_CABLE_BARRIER_MODE,
     ENDPOINT_CORRIDOR_BARRIER_MODE,
 )
+FIXED_CENTER_RATIO_PROBE_SELECTOR = (
+    "fixed_center_ratio"
+)
+ALL_BEAD_CLEARANCE_PROBE_SELECTOR = (
+    "all_bead_clearance_nearest_center"
+)
+PROBE_SELECTOR_MODES = (
+    FIXED_CENTER_RATIO_PROBE_SELECTOR,
+    ALL_BEAD_CLEARANCE_PROBE_SELECTOR,
+)
 
 
 
@@ -40,6 +50,10 @@ class HiddenRoutingGateGeometryConfig:
     leading_segment_size: int
     workspace_x: Sequence[float]
     workspace_y: Sequence[float]
+    probe_selector_mode: str = (
+        FIXED_CENTER_RATIO_PROBE_SELECTOR
+    )
+    probe_index_override: int = -1
     barrier_mode: str = (
         WHOLE_CABLE_BARRIER_MODE
     )
@@ -98,6 +112,24 @@ class HiddenRoutingGateGeometryConfig:
             raise ValueError(
                 "unsupported barrier_mode "
                 f"{mode!r}"
+            )
+
+        selector = str(
+            self.probe_selector_mode
+        )
+        if selector not in PROBE_SELECTOR_MODES:
+            raise ValueError(
+                "unsupported probe_selector_mode "
+                f"{selector!r}"
+            )
+
+        override = int(
+            self.probe_index_override
+        )
+        if override < -1:
+            raise ValueError(
+                "probe_index_override must be "
+                "-1 or an interior bead index"
             )
 
         width = float(
@@ -439,6 +471,238 @@ def _json_float(value):
     return value
 
 
+def _probe_roof_candidate(
+    beads,
+    config,
+    probe_index,
+    yaw,
+):
+    probe_index = int(
+        probe_index
+    )
+    probe = np.asarray(
+        beads[probe_index],
+        dtype=np.float64,
+    )
+    construction_epsilon = 5e-5
+    roof_bottom = float(
+        probe[2]
+        + config.bead_radius
+        + config.probe_roof_clearance
+        + construction_epsilon
+    )
+    probe_roof = {
+        "name": "probe_roof",
+        "center_xy": (
+            probe[:2]
+            .astype(float)
+            .tolist()
+        ),
+        "center_z": float(
+            roof_bottom
+            + config.probe_roof_thickness / 2
+        ),
+        "half_extents": [
+            float(
+                config.probe_roof_depth / 2
+            ),
+            float(
+                config.probe_roof_width / 2
+            ),
+            float(
+                config.probe_roof_thickness / 2
+            ),
+        ],
+        "yaw": float(yaw),
+    }
+
+    clearances = [
+        float(
+            _point_box_distance(
+                bead,
+                probe_roof,
+            )
+            - config.bead_radius
+        )
+        for bead in beads
+    ]
+    nearest_index = int(
+        np.argmin(clearances)
+    )
+    return {
+        "probe_index": probe_index,
+        "probe_roof": probe_roof,
+        "roof_bottom_z": roof_bottom,
+        "all_bead_clearance": float(
+            clearances[nearest_index]
+        ),
+        "nearest_bead_index": (
+            nearest_index
+        ),
+    }
+
+
+def select_probe_roof(
+    bead_positions,
+    config,
+):
+    beads = np.asarray(
+        bead_positions,
+        dtype=np.float64,
+    )
+    bead_count = int(
+        beads.shape[0]
+    )
+    preferred_index = int(np.clip(
+        round(
+            float(config.center_ratio)
+            * (bead_count - 1)
+        ),
+        1,
+        bead_count - 2,
+    ))
+
+    endpoint_axis = _normalize(
+        beads[-1, :2]
+        - beads[0, :2]
+    )
+    yaw = float(
+        np.arctan2(
+            endpoint_axis[1],
+            endpoint_axis[0],
+        )
+    )
+
+    override = int(
+        config.probe_index_override
+    )
+    selector = str(
+        config.probe_selector_mode
+    )
+
+    if override >= 0:
+        indices = [override]
+    elif (
+        selector
+        == FIXED_CENTER_RATIO_PROBE_SELECTOR
+    ):
+        indices = [preferred_index]
+    else:
+        indices = list(
+            range(
+                1,
+                bead_count - 1,
+            )
+        )
+
+    rows = [
+        _probe_roof_candidate(
+            beads,
+            config,
+            index,
+            yaw,
+        )
+        for index in indices
+    ]
+
+    if (
+        selector
+        == ALL_BEAD_CLEARANCE_PROBE_SELECTOR
+        and override < 0
+    ):
+        legal = [
+            row
+            for row in rows
+            if (
+                row["all_bead_clearance"]
+                + 1e-12
+                >= config.probe_roof_clearance
+            )
+        ]
+        if not legal:
+            best = max(
+                rows,
+                key=lambda row: (
+                    row["all_bead_clearance"],
+                    -abs(
+                        row["probe_index"]
+                        - preferred_index
+                    ),
+                    -row["probe_index"],
+                ),
+            )
+            raise HiddenRoutingGateGeometryError(
+                (
+                    "no interior probe bead "
+                    "satisfies all-bead roof "
+                    "clearance"
+                ),
+                {
+                    "failure": (
+                        "probe_roof_all_bead_"
+                        "clearance"
+                    ),
+                    "preferred_probe_index": (
+                        preferred_index
+                    ),
+                    "best_probe_index": int(
+                        best["probe_index"]
+                    ),
+                    "best_clearance": float(
+                        best[
+                            "all_bead_clearance"
+                        ]
+                    ),
+                    "required_clearance": float(
+                        config
+                        .probe_roof_clearance
+                    ),
+                },
+            )
+        selected = min(
+            legal,
+            key=lambda row: (
+                abs(
+                    row["probe_index"]
+                    - preferred_index
+                ),
+                -row[
+                    "all_bead_clearance"
+                ],
+                row["probe_index"],
+            ),
+        )
+        legal_indices = [
+            int(row["probe_index"])
+            for row in legal
+        ]
+    else:
+        selected = rows[0]
+        legal_indices = (
+            [int(selected["probe_index"])]
+            if (
+                selected[
+                    "all_bead_clearance"
+                ]
+                + 1e-12
+                >= config
+                .probe_roof_clearance
+            )
+            else []
+        )
+
+    return {
+        **selected,
+        "selector_mode": selector,
+        "preferred_probe_index": (
+            preferred_index
+        ),
+        "legal_probe_indices": (
+            legal_indices
+        ),
+    }
+
+
 def _barrier_candidate_geometry(
     beads,
     endpoint,
@@ -711,18 +975,50 @@ def evaluate_hidden_routing_gate_candidates(
     endpoint_axis = _normalize(
         beads[-1, :2] - beads[0, :2]
     )
+    probe_selection = (
+        select_probe_roof(
+            beads,
+            config,
+        )
+    )
+    probe_index = int(
+        probe_selection["probe_index"]
+    )
+    probe_roof = (
+        probe_selection["probe_roof"]
+    )
+    roof_bottom = float(
+        probe_selection["roof_bottom_z"]
+    )
+    roof_all_bead_clearance = float(
+        probe_selection[
+            "all_bead_clearance"
+        ]
+    )
+    if (
+        str(config.probe_selector_mode)
+        == ALL_BEAD_CLEARANCE_PROBE_SELECTOR
+    ):
+        roof_surface_clearance = (
+            roof_all_bead_clearance
+        )
+    else:
+        roof_surface_clearance = float(
+            _point_box_distance(
+                beads[probe_index],
+                probe_roof,
+            )
+            - config.bead_radius
+        )
+    roof_nearest_bead_index = int(
+        probe_selection[
+            "nearest_bead_index"
+        ]
+    )
     base_normal = np.asarray(
         [-endpoint_axis[1], endpoint_axis[0]],
         dtype=np.float64,
     )
-    preferred_probe = int(np.clip(
-        round(
-            float(config.center_ratio)
-            * (beads.shape[0] - 1)
-        ),
-        1,
-        beads.shape[0] - 2,
-    ))
     centroid = np.mean(
         beads[:, :2],
         axis=0,
@@ -738,8 +1034,6 @@ def evaluate_hidden_routing_gate_candidates(
     bounding_radius = float(
         np.sqrt(3.0) * config.bead_radius
     )
-    construction_epsilon = 5e-5
-
     rows: List[Dict[str, Any]] = []
 
     for endpoint_index in (
@@ -781,39 +1075,6 @@ def evaluate_hidden_routing_gate_candidates(
                     normal[0],
                 )
             )
-
-            probe_index = preferred_probe
-            probe = beads[probe_index]
-            roof_bottom = float(
-                probe[2]
-                + config.bead_radius
-                + config.probe_roof_clearance
-                + construction_epsilon
-            )
-            probe_roof = {
-                "name": "probe_roof",
-                "center_xy": (
-                    probe[:2]
-                    .astype(float)
-                    .tolist()
-                ),
-                "center_z": float(
-                    roof_bottom
-                    + config.probe_roof_thickness / 2
-                ),
-                "half_extents": [
-                    float(
-                        config.probe_roof_depth / 2
-                    ),
-                    float(
-                        config.probe_roof_width / 2
-                    ),
-                    float(
-                        config.probe_roof_thickness / 2
-                    ),
-                ],
-                "yaw": yaw_tangent,
-            }
 
             stage1_target = (
                 endpoint[:2]
@@ -895,13 +1156,6 @@ def evaluate_hidden_routing_gate_candidates(
                     barrier,
                 ) - bounding_radius
                 for bead in beads
-            )
-            roof_surface_clearance = (
-                _point_box_distance(
-                    probe,
-                    probe_roof,
-                )
-                - config.bead_radius
             )
             minimum_clearance = float(min(
                 barrier_surface_clearance,
@@ -997,6 +1251,25 @@ def evaluate_hidden_routing_gate_candidates(
                 "probe_index": int(
                     probe_index
                 ),
+                "probe_selector_mode": str(
+                    probe_selection[
+                        "selector_mode"
+                    ]
+                ),
+                "preferred_probe_index": int(
+                    probe_selection[
+                        "preferred_probe_index"
+                    ]
+                ),
+                "probe_roof_nearest_bead_index": (
+                    roof_nearest_bead_index
+                ),
+                "legal_probe_indices": [
+                    int(value)
+                    for value in probe_selection[
+                        "legal_probe_indices"
+                    ]
+                ],
                 "normal_xy": (
                     normal.astype(float).tolist()
                 ),
@@ -1103,6 +1376,35 @@ def evaluate_hidden_routing_gate_candidates(
         "barrier_safety_margin": float(
             config.barrier_safety_margin
         ),
+        "probe_selection": {
+            "selector_mode": str(
+                probe_selection[
+                    "selector_mode"
+                ]
+            ),
+            "preferred_probe_index": int(
+                probe_selection[
+                    "preferred_probe_index"
+                ]
+            ),
+            "selected_probe_index": int(
+                probe_index
+            ),
+            "selected_all_bead_clearance": (
+                float(
+                    roof_all_bead_clearance
+                )
+            ),
+            "nearest_bead_index": int(
+                roof_nearest_bead_index
+            ),
+            "legal_probe_indices": [
+                int(value)
+                for value in probe_selection[
+                    "legal_probe_indices"
+                ]
+            ],
+        },
         "topology_id": str(
             config.topology_id
         ),
@@ -1211,6 +1513,19 @@ def compute_hidden_routing_gate_layout(
     return {
         "snapshot_version": (
             "ccda_hidden_routing_gate_"
+            "layout_v1r3"
+            if (
+                str(config.barrier_mode)
+                == ENDPOINT_CORRIDOR_BARRIER_MODE
+                and str(
+                    config.probe_selector_mode
+                )
+                == (
+                    ALL_BEAD_CLEARANCE_PROBE_SELECTOR
+                )
+            )
+            else
+            "ccda_hidden_routing_gate_"
             "layout_v1r2"
             if (
                 str(config.barrier_mode)
@@ -1219,6 +1534,33 @@ def compute_hidden_routing_gate_layout(
             else
             "ccda_hidden_routing_gate_"
             "layout_v1r1"
+        ),
+        "probe_selector_mode": str(
+            config.probe_selector_mode
+        ),
+        "preferred_probe_index": int(
+            audit["probe_selection"][
+                "preferred_probe_index"
+            ]
+        ),
+        "selected_probe_index": int(
+            audit["probe_selection"][
+                "selected_probe_index"
+            ]
+        ),
+        "probe_roof_nearest_bead_index": (
+            int(
+                audit["probe_selection"][
+                    "nearest_bead_index"
+                ]
+            )
+        ),
+        "probe_roof_all_bead_clearance": (
+            float(
+                audit["probe_selection"][
+                    "selected_all_bead_clearance"
+                ]
+            )
         ),
         "barrier_mode": str(
             selected["barrier_mode"]

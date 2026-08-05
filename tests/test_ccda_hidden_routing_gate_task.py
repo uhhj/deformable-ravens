@@ -65,3 +65,21 @@ def test_formal_sensor_observation_has_no_topology_or_condition():
     source = inspect.getsource(Environment.ccda_sensor_observation)
     for forbidden in ("topology", "hidden_condition", "routing_gate"):
         assert forbidden not in source
+
+
+def test_routing_task_tracks_selected_probe():
+    task = CCDAHiddenRoutingGateCable()
+    assert task._selected_probe_index is None
+
+
+def test_routing_task_uses_selector_env(monkeypatch):
+    monkeypatch.setenv(
+        "CCDA_ROUTING_PROBE_SELECTOR_MODE",
+        "all_bead_clearance_nearest_center",
+    )
+    task = CCDAHiddenRoutingGateCable()
+    assert (
+        task._routing_config()
+        .probe_selector_mode
+        == "all_bead_clearance_nearest_center"
+    )
