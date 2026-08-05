@@ -222,6 +222,9 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
             "arm_mae_jump": self._arm_mae_jump,
         }
 
+    def arm_ccda_hidden_factor_after_settle(self) -> Dict[str, Any]:
+        return self.arm_hidden_friction_after_settle()
+
     def ccda_is_armed(self) -> bool:
         return bool(self._hidden_friction_armed)
 

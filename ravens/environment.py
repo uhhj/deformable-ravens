@@ -51,10 +51,12 @@ class Environment():
                            'sweep':      self.sweep,
                            'pick_place': self.pick_place,
                            'pick_probe_return': self.pick_probe_return,
-                           'pick_planar_microprobe': self.pick_planar_microprobe}
+                           'pick_planar_microprobe': self.pick_planar_microprobe,
+                           'pick_precise_probe_return': self.pick_precise_probe_return}
 
         self._ccda_video_recorder = None
         self._ccda_video_label = ""
+        self._ccda_motion_events = []
         # Phase3.12d-r1: serialize background physics with snapshot IO and
         # surface task-hook failures instead of silently killing the thread.
         self._ccda_step_lock = threading.RLock()
@@ -207,6 +209,7 @@ class Environment():
         """Reset Python-side fields after ``pybullet.restoreState``."""
         self._ccda_physics_hook_error = None
         self._ccda_video_label = ""
+        self._ccda_motion_events = []
 
         ee = self.ee
         if ee is None:
@@ -231,6 +234,12 @@ class Environment():
         """Attach or detach an optional CCDA simulation video recorder."""
         self._ccda_video_recorder = recorder
         self._ccda_video_label = ""
+
+    def reset_ccda_motion_events(self):
+        self._ccda_motion_events = []
+
+    def ccda_motion_events(self):
+        return [dict(event) for event in self._ccda_motion_events]
 
     def record_ccda_frame(self, label=""):
         """Public frame-capture entry point for idle simulation phases."""
@@ -440,16 +449,20 @@ class Environment():
         if disable_render_load:
             p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
         (obs, _, _, _) = self.step()
-        defer_hidden_friction = (
-            os.environ.get('CCDA_DEFER_HIDDEN_FRICTION_ARMING', '0') == '1'
+        defer_hidden_factor = (
+            os.environ.get(
+                'CCDA_DEFER_HIDDEN_FACTOR_ARMING',
+                os.environ.get('CCDA_DEFER_HIDDEN_FRICTION_ARMING', '0'),
+            ) == '1'
         )
-        if (
-            isinstance(self.task, tasks.names['ccda-hidden-friction-cable'])
-            and not defer_hidden_friction
-        ):
-            # Arm only after the visible force-free geometry has settled.
+        arm_hidden_factor = getattr(
+            self.task,
+            'arm_ccda_hidden_factor_after_settle',
+            None,
+        )
+        if callable(arm_hidden_factor) and not defer_hidden_factor:
             self.pause()
-            self.task.arm_hidden_friction_after_settle()
+            arm_hidden_factor()
             self.start()
         return obs
 
@@ -661,12 +674,14 @@ class Environment():
     # Robot Movement Functions
     #-------------------------------------------------------------------------
 
-    def _movej_fixed(self, targj, speed=0.01, t_lim=20):
-        """Move joints with one deterministic control update per fixed step."""
+    def _movej_fixed(self, targj, speed=0.01, t_lim=20, joint_tolerance=None):
         targj = np.asarray(targj, dtype=np.float64)
         speed = float(speed)
+        tolerance = 1e-2 if joint_tolerance is None else float(joint_tolerance)
         if speed <= 0:
             raise ValueError('movej speed must be positive')
+        if tolerance <= 0:
+            raise ValueError('joint_tolerance must be positive')
 
         max_physics_steps = max(1, int(round(float(t_lim) * self.hz)))
         max_iterations = max(
@@ -679,12 +694,11 @@ class Environment():
                 dtype=np.float64,
             )
             diffj = targj - currj
-            if np.all(np.abs(diffj) < 1e-2):
+            if np.all(np.abs(diffj) < tolerance):
                 return True
-
             norm = float(np.linalg.norm(diffj))
             velocity = diffj / norm if norm > 0 else np.zeros_like(diffj)
-            stepj = currj + velocity * speed
+            stepj = currj + velocity * min(speed, norm)
             p.setJointMotorControlArray(
                 bodyIndex=self.ur5,
                 jointIndices=self.joints,
@@ -695,46 +709,138 @@ class Environment():
             self._ccda_record_frame('movej')
             self.step_physics(self.control_substeps)
 
-        print(
-            'Warning: deterministic movej exceeded {} physics steps. '
-            'Skipping.'.format(max_physics_steps)
-        )
+        print('Warning: deterministic movej exceeded {} physics steps.'.format(max_physics_steps))
         return False
 
-    def movej(self, targj, speed=0.01, t_lim=20):
-        """Move UR5 to target joint configuration."""
+    def movej(self, targj, speed=0.01, t_lim=20, joint_tolerance=None):
+        tolerance = 1e-2 if joint_tolerance is None else float(joint_tolerance)
+        if tolerance <= 0:
+            raise ValueError('joint_tolerance must be positive')
         if self.deterministic:
-            return self._movej_fixed(targj, speed=speed, t_lim=t_lim)
-        t0 = time.time()
-        while (time.time() - t0) < t_lim:
-            currj = [p.getJointState(self.ur5, i)[0] for i in self.joints]
-            currj = np.array(currj)
-            diffj = targj - currj
-            if all(np.abs(diffj) < 1e-2):
-                return True
+            return self._movej_fixed(
+                targj,
+                speed=speed,
+                t_lim=t_lim,
+                joint_tolerance=tolerance,
+            )
 
-            # Move with constant velocity
-            norm = np.linalg.norm(diffj)
-            v = diffj / norm if norm > 0 else 0
-            stepj = currj + v * speed
-            gains = np.ones(len(self.joints))
+        t0 = time.time()
+        while time.time() - t0 < t_lim:
+            currj = np.asarray(
+                [p.getJointState(self.ur5, i)[0] for i in self.joints],
+                dtype=np.float64,
+            )
+            diffj = np.asarray(targj) - currj
+            if np.all(np.abs(diffj) < tolerance):
+                return True
+            norm = float(np.linalg.norm(diffj))
+            velocity = diffj / norm if norm > 0 else 0
+            stepj = currj + velocity * min(speed, norm)
             p.setJointMotorControlArray(
                 bodyIndex=self.ur5,
                 jointIndices=self.joints,
                 controlMode=p.POSITION_CONTROL,
                 targetPositions=stepj,
-                positionGains=gains)
-            self._ccda_record_frame("movej")
+                positionGains=np.ones(len(self.joints)),
+            )
+            self._ccda_record_frame('movej')
             time.sleep(0.001)
-        print('Warning: movej exceeded {} sec timeout. Skipping.'.format(t_lim))
+        print('Warning: movej exceeded {} sec timeout.'.format(t_lim))
         return False
 
-    def movep(self, pose, speed=0.01):
-        """Move UR5 to target end effector pose."""
-        # # Keep joint angles between -180/+180
-        # targj[5] = ((targj[5] + np.pi) % (2 * np.pi) - np.pi)
+    def movep(self, pose, speed=0.01, joint_tolerance=None):
         targj = self.solve_IK(pose)
-        return self.movej(targj, speed, self.t_lim)
+        return self.movej(
+            targj,
+            speed,
+            self.t_lim,
+            joint_tolerance=joint_tolerance,
+        )
+
+    def movep_precise(
+            self,
+            pose,
+            speed=0.001,
+            joint_tolerance=1e-4,
+            cartesian_tolerance=2e-4,
+            max_corrections=3,
+            label='precise_move'):
+        if not self.deterministic:
+            raise RuntimeError('movep_precise requires deterministic execution')
+
+        target = np.asarray(pose, dtype=np.float64).reshape(-1)
+        if target.size != 7:
+            raise ValueError('pose must contain XYZ plus quaternion')
+        if joint_tolerance <= 0 or cartesian_tolerance <= 0:
+            raise ValueError('tolerances must be positive')
+        max_corrections = int(max_corrections)
+        if max_corrections <= 0:
+            raise ValueError('max_corrections must be positive')
+
+        before = np.asarray(
+            p.getLinkState(
+                self.ur5,
+                self.ee_tip_link,
+                computeForwardKinematics=True,
+            )[0],
+            dtype=np.float64,
+        )
+        success = True
+        after = before.copy()
+        endpoint_error = float(np.linalg.norm(target[:3] - before))
+        corrections_used = 0
+        command_target = target.copy()
+
+        for correction in range(max_corrections):
+            corrections_used = correction + 1
+            success &= self.movep(
+                command_target,
+                speed=speed,
+                joint_tolerance=joint_tolerance,
+            )
+            after = np.asarray(
+                p.getLinkState(
+                    self.ur5,
+                    self.ee_tip_link,
+                    computeForwardKinematics=True,
+                )[0],
+                dtype=np.float64,
+            )
+            endpoint_error = float(np.linalg.norm(target[:3] - after))
+            if endpoint_error <= cartesian_tolerance:
+                break
+            command_target[:3] += target[:3] - after
+
+        requested_vector = target[:3] - before
+        achieved_vector = after - before
+        requested_distance = float(np.linalg.norm(requested_vector))
+        achieved_distance = float(np.linalg.norm(achieved_vector))
+        if requested_distance > 1e-12:
+            achieved_projection = float(
+                np.dot(achieved_vector, requested_vector / requested_distance)
+            )
+            achieved_fraction = achieved_projection / requested_distance
+        else:
+            achieved_projection = 0.0
+            achieved_fraction = 1.0
+
+        event = {
+            'label': str(label),
+            'requested_position': target[:3].astype(float).tolist(),
+            'before_position': before.astype(float).tolist(),
+            'after_position': after.astype(float).tolist(),
+            'requested_distance': requested_distance,
+            'achieved_distance': achieved_distance,
+            'achieved_projection': achieved_projection,
+            'achieved_fraction': float(achieved_fraction),
+            'endpoint_error': endpoint_error,
+            'joint_tolerance': float(joint_tolerance),
+            'cartesian_tolerance': float(cartesian_tolerance),
+            'corrections_used': int(corrections_used),
+            'success': bool(success and endpoint_error <= cartesian_tolerance),
+        }
+        self._ccda_motion_events.append(event)
+        return bool(event['success'])
 
     def solve_IK(self, pose):
         homej_list = np.array(self.homej).tolist()
@@ -1131,6 +1237,138 @@ class Environment():
         self._ccda_record_frame('micro_retreat')
         success &= self.movep(retreat_pose, speed=speed)
         self._ccda_record_frame('micro_done')
+        return bool(success)
+
+    def pick_precise_probe_return(
+            self,
+            pose0,
+            pose_probe,
+            pose_return,
+            lift_height=0.002,
+            hold_steps=60,
+            return_hold_steps=120,
+            post_release_steps=120,
+            approach_height=0.02,
+            retreat_z=0.3,
+            joint_tolerance=1e-4,
+            cartesian_tolerance=2e-4,
+            min_achieved_fraction=0.8):
+        if not self.deterministic:
+            raise RuntimeError('pick_precise_probe_return requires fixed-step mode')
+        if lift_height <= 0:
+            raise ValueError('lift_height must be positive')
+        if min(hold_steps, return_hold_steps, post_release_steps) < 0:
+            raise ValueError('hold steps must be non-negative')
+
+        speed = 0.001
+        delta_z = -0.0005
+        if hasattr(self.task, 'primitive_params'):
+            params = self.task.primitive_params[self.task.task_stage]
+            speed = float(params.get('speed', speed))
+            delta_z = float(params.get('delta_z', delta_z))
+        if delta_z >= 0:
+            raise ValueError('delta_z must be negative')
+
+        deformable_ids = getattr(self.task, 'def_IDs', [])
+        pick = np.asarray(pose0[0], dtype=np.float64)
+        rotation = np.asarray(pose0[1], dtype=np.float64)
+        probe = np.asarray(pose_probe[0], dtype=np.float64)
+        returned = np.asarray(pose_return[0], dtype=np.float64)
+
+        success = True
+        approach = np.hstack(([pick[0], pick[1], pick[2] + approach_height], rotation))
+        success &= self.movep(approach, speed=speed)
+
+        lower = approach.copy()
+        floor_limit = max(0.0, float(pick[2]) - 0.01)
+        while not self.ee.detect_contact(deformable_ids) and lower[2] > floor_limit:
+            lower[2] += delta_z
+            success &= self.movep(lower, speed=speed, joint_tolerance=joint_tolerance)
+            if not success:
+                return False
+
+        self.ee.activate(self.objects, deformable_ids)
+        if not self.ee.check_grasp():
+            self.ee.release()
+            return False
+
+        tip_position = np.asarray(
+            p.getLinkState(
+                self.ur5,
+                self.ee_tip_link,
+                computeForwardKinematics=True,
+            )[0],
+            dtype=np.float64,
+        )
+        probe_z = float(tip_position[2]) + float(lift_height)
+
+        lift = np.hstack((
+            [tip_position[0], tip_position[1], probe_z],
+            rotation,
+        ))
+        success &= self.movep_precise(
+            lift,
+            speed=speed,
+            joint_tolerance=joint_tolerance,
+            cartesian_tolerance=cartesian_tolerance,
+            label='hook_probe_lift',
+        )
+        probe_delta = probe[:2] - pick[:2]
+        outward = np.hstack((
+            [
+                tip_position[0] + probe_delta[0],
+                tip_position[1] + probe_delta[1],
+                probe_z,
+            ],
+            rotation,
+        ))
+        success &= self.movep_precise(
+            outward,
+            speed=speed,
+            joint_tolerance=joint_tolerance,
+            cartesian_tolerance=cartesian_tolerance,
+            label='hook_probe_out',
+        )
+        if self._ccda_motion_events[-1]['achieved_fraction'] < min_achieved_fraction:
+            success = False
+        if hold_steps:
+            self.step_physics(int(hold_steps))
+
+        return_delta = returned[:2] - pick[:2]
+        return_pose = np.hstack((
+            [
+                tip_position[0] + return_delta[0],
+                tip_position[1] + return_delta[1],
+                probe_z,
+            ],
+            rotation,
+        ))
+        success &= self.movep_precise(
+            return_pose,
+            speed=speed,
+            joint_tolerance=joint_tolerance,
+            cartesian_tolerance=cartesian_tolerance,
+            label='hook_probe_return',
+        )
+        if return_hold_steps:
+            self.step_physics(int(return_hold_steps))
+
+        release_pose = return_pose.copy()
+        release_pose[2] = float(tip_position[2])
+        success &= self.movep_precise(
+            release_pose,
+            speed=speed,
+            joint_tolerance=joint_tolerance,
+            cartesian_tolerance=cartesian_tolerance,
+            label='hook_probe_lower_release',
+        )
+        self.ee.release()
+        if post_release_steps:
+            self.step_physics(int(post_release_steps))
+
+        retreat = release_pose.copy()
+        retreat[2] = float(retreat_z)
+        success &= self.movep(retreat, speed=speed)
         return bool(success)
 
     def sweep(self, pose0, pose1):
