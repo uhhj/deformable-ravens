@@ -269,6 +269,37 @@ class Environment():
             ),
         }
 
+    def _ccda_target_bead_body_id(
+            self,
+            target_bead_index):
+        if target_bead_index is None:
+            return None
+        return int(
+            self.task.cable_bead_IDs[
+                int(target_bead_index)
+            ]
+        )
+
+    def _ccda_target_constraint_created(
+            self,
+            target_body_id):
+        constraint_id = getattr(
+            self.ee,
+            'contact_constraint',
+            None,
+        )
+        if constraint_id is None:
+            return False
+        if target_body_id is None:
+            return True
+
+        info = p.getConstraintInfo(
+            int(constraint_id)
+        )
+        return int(info[2]) == int(
+            target_body_id
+        )
+
     def reset_ccda_motion_events(self):
         self._ccda_motion_events = []
 
@@ -1635,7 +1666,8 @@ class Environment():
             min_achieved_fraction=0.8,
             acquisition_motion_mode=(
                 'legacy_joint_return'
-            )):
+            ),
+            target_bead_index=None):
         acquisition_motion_mode = str(
             acquisition_motion_mode
         )
@@ -1686,6 +1718,30 @@ class Environment():
             counter()
         )
 
+        deformable_ids = getattr(
+            self.task,
+            'def_IDs',
+            [],
+        )
+        target_body_id = (
+            self._ccda_target_bead_body_id(
+                target_bead_index
+            )
+        )
+
+        def contact_now():
+            if target_body_id is None:
+                return bool(
+                    self.ee.detect_contact(
+                        deformable_ids
+                    )
+                )
+            return bool(
+                self.ee.detect_target_contact(
+                    target_body_id
+                )
+            )
+
         def record_probe_acquisition(
                 *,
                 success,
@@ -1694,6 +1750,7 @@ class Environment():
                 contact_detected,
                 grasp_active,
                 constraint_available,
+                target_constraint_created,
                 lower_step_count):
             physics_step_end = int(
                 counter()
@@ -1721,6 +1778,24 @@ class Environment():
                 ),
                 'constraint_available_after': bool(
                     constraint_available
+                ),
+                'target_bead_index': (
+                    None
+                    if target_bead_index is None
+                    else int(target_bead_index)
+                ),
+                'target_body_id': (
+                    None
+                    if target_body_id is None
+                    else int(target_body_id)
+                ),
+                'target_contact_detected': bool(
+                    contact_detected
+                    if target_body_id is not None
+                    else False
+                ),
+                'target_constraint_created': bool(
+                    target_constraint_created
                 ),
                 'lower_step_count': int(
                     lower_step_count
@@ -1759,7 +1834,6 @@ class Environment():
                 )
             return event
 
-        deformable_ids = getattr(self.task, 'def_IDs', [])
         pick = np.asarray(pose0[0], dtype=np.float64)
         rotation = np.asarray(pose0[1], dtype=np.float64)
         success = True
@@ -1804,6 +1878,7 @@ class Environment():
                 contact_detected=False,
                 grasp_active=False,
                 constraint_available=False,
+                target_constraint_created=False,
                 lower_step_count=0,
             )
             return False
@@ -1816,9 +1891,7 @@ class Environment():
         lower_step_count = 0
 
         while (
-                not self.ee.detect_contact(
-                    deformable_ids
-                )
+                not contact_now()
                 and lower[2] > floor_limit):
             lower[2] = max(
                 floor_limit,
@@ -1866,25 +1939,48 @@ class Environment():
                     contact_detected=False,
                     grasp_active=False,
                     constraint_available=False,
+                    target_constraint_created=False,
                     lower_step_count=(
                         lower_step_count
                     ),
                 )
                 return False
 
-        contact_detected = bool(
-            self.ee.detect_contact(
-                deformable_ids
-            )
-        )
+        contact_detected = contact_now()
 
-        self.ee.activate(
-            self.objects,
-            deformable_ids,
-        )
-        grasp_active = bool(
-            self.ee.check_grasp()
-        )
+        if (
+            target_body_id is not None
+            and not contact_detected
+        ):
+            record_probe_acquisition(
+                success=False,
+                failure_reason=(
+                    'contact_not_detected'
+                ),
+                approach_success=True,
+                contact_detected=False,
+                grasp_active=False,
+                constraint_available=False,
+                target_constraint_created=False,
+                lower_step_count=(
+                    lower_step_count
+                ),
+            )
+            return False
+
+        if target_body_id is None:
+            self.ee.activate(
+                self.objects,
+                deformable_ids,
+            )
+        else:
+            self.ee.activate(
+                self.objects,
+                deformable_ids,
+                target_object_id=(
+                    target_body_id
+                ),
+            )
         constraint_available = bool(
             getattr(
                 self.ee,
@@ -1893,13 +1989,35 @@ class Environment():
             )
             is not None
         )
+        target_constraint_created = (
+            self._ccda_target_constraint_created(
+                target_body_id
+            )
+        )
+        grasp_active = bool(
+            self.ee.check_grasp()
+            and (
+                target_body_id is None
+                or target_constraint_created
+            )
+        )
 
         if not grasp_active:
-            failure_reason = (
-                'grasp_failed'
-                if contact_detected
-                else 'contact_not_detected'
-            )
+            if not contact_detected:
+                failure_reason = (
+                    'contact_not_detected'
+                )
+            elif (
+                target_body_id is not None
+                and not target_constraint_created
+            ):
+                failure_reason = (
+                    'target_constraint_not_created'
+                )
+            else:
+                failure_reason = (
+                    'grasp_failed'
+                )
             record_probe_acquisition(
                 success=False,
                 failure_reason=(
@@ -1912,6 +2030,9 @@ class Environment():
                 grasp_active=False,
                 constraint_available=(
                     constraint_available
+                ),
+                target_constraint_created=(
+                    target_constraint_created
                 ),
                 lower_step_count=(
                     lower_step_count
@@ -1930,6 +2051,9 @@ class Environment():
             grasp_active=True,
             constraint_available=(
                 constraint_available
+            ),
+            target_constraint_created=(
+                target_constraint_created
             ),
             lower_step_count=(
                 lower_step_count
@@ -2015,7 +2139,10 @@ class Environment():
             joint_tolerance=1e-4,
             cartesian_tolerance=2e-4,
             min_achieved_fraction=0.8,
-            acquisition_motion_mode='legacy_joint_return'):
+            acquisition_motion_mode=(
+                'legacy_joint_return'
+            ),
+            target_bead_index=None):
         """One grasp, two collinear waypoints, then release."""
         if not self.deterministic:
             raise RuntimeError(
@@ -2080,6 +2207,30 @@ class Environment():
             counter()
         )
 
+        deformable_ids = getattr(
+            self.task,
+            'def_IDs',
+            [],
+        )
+        target_body_id = (
+            self._ccda_target_bead_body_id(
+                target_bead_index
+            )
+        )
+
+        def contact_now():
+            if target_body_id is None:
+                return bool(
+                    self.ee.detect_contact(
+                        deformable_ids
+                    )
+                )
+            return bool(
+                self.ee.detect_target_contact(
+                    target_body_id
+                )
+            )
+
         def record_acquisition(
                 *,
                 success,
@@ -2088,6 +2239,7 @@ class Environment():
                 contact_detected,
                 grasp_active,
                 constraint_available,
+                target_constraint_created,
                 lower_step_count):
             physics_step_end = int(
                 counter()
@@ -2109,6 +2261,24 @@ class Environment():
                 ),
                 'constraint_available_after': bool(
                     constraint_available
+                ),
+                'target_bead_index': (
+                    None
+                    if target_bead_index is None
+                    else int(target_bead_index)
+                ),
+                'target_body_id': (
+                    None
+                    if target_body_id is None
+                    else int(target_body_id)
+                ),
+                'target_contact_detected': bool(
+                    contact_detected
+                    if target_body_id is not None
+                    else False
+                ),
+                'target_constraint_created': bool(
+                    target_constraint_created
                 ),
                 'lower_step_count': int(
                     lower_step_count
@@ -2147,7 +2317,6 @@ class Environment():
                 )
             return event
 
-        deformable_ids = getattr(self.task, 'def_IDs', [])
         pick = np.asarray(pose0[0], dtype=np.float64)
         stage1 = np.asarray(pose_stage1[0], dtype=np.float64)
         final = np.asarray(pose1[0], dtype=np.float64)
@@ -2207,6 +2376,7 @@ class Environment():
                 contact_detected=False,
                 grasp_active=False,
                 constraint_available=False,
+                target_constraint_created=False,
                 lower_step_count=0,
             )
             return False
@@ -2219,9 +2389,7 @@ class Environment():
         lower_step_count = 0
 
         while (
-                not self.ee.detect_contact(
-                    deformable_ids
-                )
+                not contact_now()
                 and lower[2] > floor_limit):
             lower[2] = max(
                 floor_limit,
@@ -2266,17 +2434,14 @@ class Environment():
                     contact_detected=False,
                     grasp_active=False,
                     constraint_available=False,
+                    target_constraint_created=False,
                     lower_step_count=(
                         lower_step_count
                     ),
                 )
                 return False
 
-        contact_detected = bool(
-            self.ee.detect_contact(
-                deformable_ids
-            )
-        )
+        contact_detected = contact_now()
         if not contact_detected:
             record_acquisition(
                 success=False,
@@ -2287,19 +2452,26 @@ class Environment():
                 contact_detected=False,
                 grasp_active=False,
                 constraint_available=False,
+                target_constraint_created=False,
                 lower_step_count=(
                     lower_step_count
                 ),
             )
             return False
 
-        self.ee.activate(
-            self.objects,
-            deformable_ids,
-        )
-        grasp_active = bool(
-            self.ee.check_grasp()
-        )
+        if target_body_id is None:
+            self.ee.activate(
+                self.objects,
+                deformable_ids,
+            )
+        else:
+            self.ee.activate(
+                self.objects,
+                deformable_ids,
+                target_object_id=(
+                    target_body_id
+                ),
+            )
         constraint_available = bool(
             getattr(
                 self.ee,
@@ -2308,16 +2480,48 @@ class Environment():
             )
             is not None
         )
+        target_constraint_created = (
+            self._ccda_target_constraint_created(
+                target_body_id
+            )
+        )
+        grasp_active = bool(
+            self.ee.check_grasp()
+            and (
+                target_body_id is None
+                or target_constraint_created
+            )
+        )
 
         if not grasp_active:
+            if not contact_detected:
+                failure_reason = (
+                    'contact_not_detected'
+                )
+            elif (
+                target_body_id is not None
+                and not target_constraint_created
+            ):
+                failure_reason = (
+                    'target_constraint_not_created'
+                )
+            else:
+                failure_reason = (
+                    'grasp_failed'
+                )
             record_acquisition(
                 success=False,
-                failure_reason='grasp_failed',
+                failure_reason=(
+                    failure_reason
+                ),
                 approach_success=True,
                 contact_detected=True,
                 grasp_active=False,
                 constraint_available=(
                     constraint_available
+                ),
+                target_constraint_created=(
+                    target_constraint_created
                 ),
                 lower_step_count=(
                     lower_step_count
@@ -2337,6 +2541,9 @@ class Environment():
             grasp_active=True,
             constraint_available=(
                 constraint_available
+            ),
+            target_constraint_created=(
+                target_constraint_created
             ),
             lower_step_count=(
                 lower_step_count

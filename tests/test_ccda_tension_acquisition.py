@@ -8,6 +8,11 @@ class FakeTask:
     def __init__(self):
         self.step = 0
         self.def_IDs = [100]
+        self.cable_bead_IDs = [
+            40,
+            41,
+            42,
+        ]
         self.task_stage = 1
         self.primitive_params = {
             1: {
@@ -31,12 +36,33 @@ class FakeEE:
         self.contact_constraint = None
         self.detect_calls = 0
         self.active = False
+        self.target_object_id = None
 
     def detect_contact(self, ids):
         self.detect_calls += 1
         return self.detect_calls >= 2
 
-    def activate(self, objects, ids):
+    def detect_target_contact(
+        self,
+        target_object_id,
+    ):
+        self.target_object_id = int(
+            target_object_id
+        )
+        self.detect_calls += 1
+        return self.detect_calls >= 2
+
+    def activate(
+        self,
+        objects,
+        ids,
+        target_object_id=None,
+    ):
+        self.target_object_id = (
+            None
+            if target_object_id is None
+            else int(target_object_id)
+        )
         self.active = self.grasp_success
         self.contact_constraint = (
             11
@@ -119,6 +145,16 @@ def make_env(
             ),
         ),
     )
+    monkeypatch.setattr(
+        environment.p,
+        "getConstraintInfo",
+        lambda constraint_id: (
+            0,
+            0,
+            env.ee.target_object_id,
+            -1,
+        ),
+    )
     return env
 
 
@@ -174,6 +210,7 @@ def test_precise_acquisition_reaches_formal_motion(
             acquisition_motion_mode=(
                 "precise_endpoint_recovery"
             ),
+            target_bead_index=0,
         )
     )
 
@@ -213,6 +250,19 @@ def test_precise_acquisition_reaches_formal_motion(
     assert acquisition[
         "grasp_active_after"
     ]
+    assert acquisition[
+        "target_bead_index"
+    ] == 0
+    assert acquisition[
+        "target_body_id"
+    ] == 40
+    assert acquisition[
+        "target_contact_detected"
+    ]
+    assert acquisition[
+        "target_constraint_created"
+    ]
+    assert env.ee.target_object_id == 40
 
 
 def test_grasp_failure_is_recorded_before_lift(
@@ -232,6 +282,7 @@ def test_grasp_failure_is_recorded_before_lift(
             acquisition_motion_mode=(
                 "precise_endpoint_recovery"
             ),
+            target_bead_index=0,
         )
     )
 
@@ -256,12 +307,15 @@ def test_grasp_failure_is_recorded_before_lift(
     assert not acquisition["success"]
     assert acquisition[
         "failure_reason"
-    ] == "grasp_failed"
+    ] == "target_constraint_not_created"
     assert acquisition[
         "contact_detected"
     ]
     assert not acquisition[
         "grasp_active_after"
+    ]
+    assert not acquisition[
+        "target_constraint_created"
     ]
 
 
@@ -281,6 +335,7 @@ def test_lower_steps_do_not_create_event_rows(
         acquisition_motion_mode=(
             "precise_endpoint_recovery"
         ),
+        target_bead_index=0,
     )
 
     assert all(

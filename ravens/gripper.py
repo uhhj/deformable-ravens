@@ -91,58 +91,148 @@ class Suction(Gripper):
         self.init_grip_distance = None
         self.init_grip_item = None
 
-    def activate(self, possible_objects, def_IDs):
+    def _create_rigid_contact_constraint(
+            self,
+            object_id,
+            contact_link):
+        object_id = int(object_id)
+        contact_link = int(contact_link)
+
+        body_pose = p.getLinkState(
+            self.body,
+            0,
+        )
+        object_pose = (
+            p.getBasePositionAndOrientation(
+                object_id
+            )
+        )
+        world_to_body = p.invertTransform(
+            body_pose[0],
+            body_pose[1],
+        )
+        object_to_body = (
+            p.multiplyTransforms(
+                world_to_body[0],
+                world_to_body[1],
+                object_pose[0],
+                object_pose[1],
+            )
+        )
+        self.contact_constraint = (
+            p.createConstraint(
+                parentBodyUniqueId=(
+                    self.body
+                ),
+                parentLinkIndex=0,
+                childBodyUniqueId=(
+                    object_id
+                ),
+                childLinkIndex=(
+                    contact_link
+                ),
+                jointType=p.JOINT_FIXED,
+                jointAxis=(0, 0, 0),
+                parentFramePosition=(
+                    object_to_body[0]
+                ),
+                parentFrameOrientation=(
+                    object_to_body[1]
+                ),
+                childFramePosition=(
+                    0,
+                    0,
+                    0,
+                ),
+                childFrameOrientation=(
+                    0,
+                    0,
+                    0,
+                ),
+            )
+        )
+        distance = np.linalg.norm(
+            np.float32(body_pose[0])
+            - np.float32(object_pose[0])
+        )
+        self.init_grip_distance = (
+            distance
+        )
+        self.init_grip_item = object_id
+
+    def detect_target_contact(
+            self,
+            target_object_id):
+        points = p.getContactPoints(
+            bodyA=self.body,
+            linkIndexA=0,
+            bodyB=int(
+                target_object_id
+            ),
+        )
+        return len(points) > 0
+
+    def activate(
+            self,
+            possible_objects,
+            def_IDs,
+            target_object_id=None):
         """
         Simulates suction by creating rigid fixed constraint between suction
         gripper and contacted object.
 
         :def_IDs: a list of IDs of deformable objects.
         """
-        if not self.activated:
-            # Only report contact points involving linkIndexA of bodyA (the
-            # suction) -- returns a list (actually, a tuple) of such points.
-            points = p.getContactPoints(bodyA=self.body, linkIndexA=0)
+        if self.activated:
+            return
 
-            if len(points) > 0:
-                # Handle contact with a rigid object.
-                for point in points:
-                    object_id, contact_link = point[2], point[4]
-                if object_id in possible_objects:
-                    body_pose = p.getLinkState(self.body, 0)
-                    object_pose = p.getBasePositionAndOrientation(object_id)
-                    world_to_body = p.invertTransform(
-                        body_pose[0], body_pose[1])
-                    object_to_body = p.multiplyTransforms(
-                        world_to_body[0], world_to_body[1],
-                        object_pose[0], object_pose[1])
-                    self.contact_constraint = p.createConstraint(
-                        parentBodyUniqueId=self.body,
-                        parentLinkIndex=0,
-                        childBodyUniqueId=object_id,
-                        childLinkIndex=contact_link,
-                        jointType=p.JOINT_FIXED,
-                        jointAxis=(0, 0, 0),
-                        parentFramePosition=object_to_body[0],
-                        parentFrameOrientation=object_to_body[1],
-                        childFramePosition=(0, 0, 0),
-                        childFrameOrientation=(0, 0, 0))
-                    # Handle the case when rigid item makes contact with a
-                    # deformable, which will cause this distance to shrink.
-                    # Assumes gripper is suctioning ONE rigid item at a time.
-                    distance = np.linalg.norm(
-                            np.float32(body_pose[0]) - np.float32(object_pose[0]))
-                    self.init_grip_distance = distance
-                    self.init_grip_item = object_id
-                #print(f'Gripping a rigid item!')
-            elif (self.def_grip_item is not None):
-                # Otherwise, focus on gripping a _deformable_ with anchors.
-                info = self.activate_def(self.def_grip_item)
-                self.def_grip_anchors = info['anchors']
-                self.def_min_vertex = info['closest_vertex']
-                self.def_min_distance = info['min_distance']
-                #print(f'Gripping a deformable!')
-
+        if target_object_id is not None:
+            target_object_id = int(
+                target_object_id
+            )
+            points = p.getContactPoints(
+                bodyA=self.body,
+                linkIndexA=0,
+                bodyB=target_object_id,
+            )
+            if points:
+                point = points[0]
+                self._create_rigid_contact_constraint(
+                    target_object_id,
+                    int(point[4]),
+                )
             self.activated = True
+            return
+
+        points = p.getContactPoints(
+            bodyA=self.body,
+            linkIndexA=0,
+        )
+
+        if len(points) > 0:
+            for point in points:
+                object_id = int(point[2])
+                contact_link = int(point[4])
+            if object_id in possible_objects:
+                self._create_rigid_contact_constraint(
+                    object_id,
+                    contact_link,
+                )
+        elif self.def_grip_item is not None:
+            info = self.activate_def(
+                self.def_grip_item
+            )
+            self.def_grip_anchors = (
+                info['anchors']
+            )
+            self.def_min_vertex = (
+                info['closest_vertex']
+            )
+            self.def_min_distance = (
+                info['min_distance']
+            )
+
+        self.activated = True
 
     def activate_def(self, defId):
         """Simulates suction by anchoring vertices of the deformable object.
