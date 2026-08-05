@@ -805,7 +805,8 @@ class Environment():
             cartesian_tolerance=2e-4,
             max_corrections=3,
             label='precise_move',
-            primitive='pick_precise_probe_return'):
+            primitive='pick_precise_probe_return',
+            record_event=True):
         if not self.deterministic:
             raise RuntimeError('movep_precise requires deterministic execution')
 
@@ -817,6 +818,7 @@ class Environment():
         max_corrections = int(max_corrections)
         if max_corrections <= 0:
             raise ValueError('max_corrections must be positive')
+        record_event = bool(record_event)
 
         before = np.asarray(
             p.getLinkState(
@@ -939,7 +941,8 @@ class Environment():
             # feedback has placed the endpoint inside the unchanged tolerance.
             'success': endpoint_reached,
         }
-        self._ccda_motion_events.append(event)
+        if record_event:
+            self._ccda_motion_events.append(event)
         return bool(event['success'])
 
     def solve_IK(self, pose):
@@ -1605,7 +1608,8 @@ class Environment():
             retreat_z=0.3,
             joint_tolerance=1e-4,
             cartesian_tolerance=2e-4,
-            min_achieved_fraction=0.8):
+            min_achieved_fraction=0.8,
+            acquisition_motion_mode='legacy_joint_return'):
         """One grasp, two collinear waypoints, then release."""
         if not self.deterministic:
             raise RuntimeError(
@@ -1618,6 +1622,20 @@ class Environment():
         joint_tolerance = float(joint_tolerance)
         cartesian_tolerance = float(cartesian_tolerance)
         min_achieved_fraction = float(min_achieved_fraction)
+        acquisition_motion_mode = str(
+            acquisition_motion_mode
+        )
+        if acquisition_motion_mode not in {
+                'legacy_joint_return',
+                'precise_endpoint_recovery'}:
+            raise ValueError(
+                'unsupported acquisition_motion_mode '
+                f'{acquisition_motion_mode!r}'
+            )
+        precise_acquisition = (
+            acquisition_motion_mode
+            == 'precise_endpoint_recovery'
+        )
         if lift_height <= 0:
             raise ValueError('lift_height must be positive')
         if approach_height <= lift_height:
@@ -1640,6 +1658,88 @@ class Environment():
             delta_z = float(params.get('delta_z', delta_z))
         if delta_z >= 0:
             raise ValueError('tension extension delta_z must be negative')
+
+        counter = getattr(
+            self.task,
+            'physics_step_count',
+            None,
+        )
+        if not callable(counter) and precise_acquisition:
+            raise RuntimeError(
+                'tension task has no physics step counter'
+            )
+        if not callable(counter):
+            counter = lambda: 0
+        acquisition_step_start = int(
+            counter()
+        )
+
+        def record_acquisition(
+                *,
+                success,
+                failure_reason,
+                approach_success,
+                contact_detected,
+                grasp_active,
+                constraint_available,
+                lower_step_count):
+            physics_step_end = int(
+                counter()
+            )
+            event = {
+                'primitive': primitive,
+                'stage': 'tension_pull_acquisition',
+                'label': 'tension_pull_acquisition',
+                'success': bool(success),
+                'failure_reason': failure_reason,
+                'approach_success': bool(
+                    approach_success
+                ),
+                'contact_detected': bool(
+                    contact_detected
+                ),
+                'grasp_active_after': bool(
+                    grasp_active
+                ),
+                'constraint_available_after': bool(
+                    constraint_available
+                ),
+                'lower_step_count': int(
+                    lower_step_count
+                ),
+                'physics_step_start': (
+                    acquisition_step_start
+                ),
+                'physics_step_end': (
+                    physics_step_end
+                ),
+                'physics_step_count': int(
+                    physics_step_end
+                    - acquisition_step_start
+                ),
+                'achieved_fraction': (
+                    1.0 if success else 0.0
+                ),
+                'joint_motion_success': bool(
+                    approach_success
+                    and failure_reason
+                    not in {
+                        'approach_motion_failed',
+                        'contact_lowering_failed',
+                    }
+                ),
+                'joint_timeout_count': 0,
+                'timeout_reason': (
+                    None
+                    if success
+                    else failure_reason
+                ),
+            }
+            if precise_acquisition:
+                self._ccda_motion_events.append(
+                    event
+                )
+            return event
 
         deformable_ids = getattr(self.task, 'def_IDs', [])
         pick = np.asarray(pose0[0], dtype=np.float64)
@@ -1670,26 +1770,172 @@ class Environment():
         approach = np.hstack((
             [pick[0], pick[1], pick[2] + approach_height], rotation
         ))
-        success &= self.movep(approach, speed=speed)
-        lower = approach.copy()
-        floor_limit = max(0.0, float(pick[2]) - 0.01)
-        while (
-                not self.ee.detect_contact(deformable_ids)
-                and lower[2] > floor_limit):
-            lower[2] += delta_z
-            success &= self.movep(
-                lower, speed=speed, joint_tolerance=joint_tolerance
+
+        if precise_acquisition:
+            approach_success = (
+                self.movep_precise(
+                    approach,
+                    speed=speed,
+                    joint_tolerance=joint_tolerance,
+                    cartesian_tolerance=(
+                        cartesian_tolerance
+                    ),
+                    label='tension_pull_approach',
+                    primitive=primitive,
+                )
             )
-            if not success:
+        else:
+            approach_success = self.movep(
+                approach,
+                speed=speed,
+            )
+
+        success &= bool(approach_success)
+        if not approach_success:
+            record_acquisition(
+                success=False,
+                failure_reason=(
+                    'approach_motion_failed'
+                ),
+                approach_success=False,
+                contact_detected=False,
+                grasp_active=False,
+                constraint_available=False,
+                lower_step_count=0,
+            )
+            return False
+
+        lower = approach.copy()
+        floor_limit = max(
+            0.0,
+            float(pick[2]) - 0.01,
+        )
+        lower_step_count = 0
+
+        while (
+                not self.ee.detect_contact(
+                    deformable_ids
+                )
+                and lower[2] > floor_limit):
+            lower[2] = max(
+                floor_limit,
+                float(lower[2] + delta_z),
+            )
+            if precise_acquisition:
+                lower_success = (
+                    self.movep_precise(
+                        lower,
+                        speed=speed,
+                        joint_tolerance=(
+                            joint_tolerance
+                        ),
+                        cartesian_tolerance=(
+                            cartesian_tolerance
+                        ),
+                        label=(
+                            'tension_pull_lower_step'
+                        ),
+                        primitive=primitive,
+                        record_event=False,
+                    )
+                )
+            else:
+                lower_success = self.movep(
+                    lower,
+                    speed=speed,
+                    joint_tolerance=(
+                        joint_tolerance
+                    ),
+                )
+
+            lower_step_count += 1
+            success &= bool(lower_success)
+            if not lower_success:
+                record_acquisition(
+                    success=False,
+                    failure_reason=(
+                        'contact_lowering_failed'
+                    ),
+                    approach_success=True,
+                    contact_detected=False,
+                    grasp_active=False,
+                    constraint_available=False,
+                    lower_step_count=(
+                        lower_step_count
+                    ),
+                )
                 return False
 
-        self.ee.activate(self.objects, deformable_ids)
-        if not self.ee.check_grasp():
+        contact_detected = bool(
+            self.ee.detect_contact(
+                deformable_ids
+            )
+        )
+        if not contact_detected:
+            record_acquisition(
+                success=False,
+                failure_reason=(
+                    'contact_not_detected'
+                ),
+                approach_success=True,
+                contact_detected=False,
+                grasp_active=False,
+                constraint_available=False,
+                lower_step_count=(
+                    lower_step_count
+                ),
+            )
+            return False
+
+        self.ee.activate(
+            self.objects,
+            deformable_ids,
+        )
+        grasp_active = bool(
+            self.ee.check_grasp()
+        )
+        constraint_available = bool(
+            getattr(
+                self.ee,
+                'contact_constraint',
+                None,
+            )
+            is not None
+        )
+
+        if not grasp_active:
+            record_acquisition(
+                success=False,
+                failure_reason='grasp_failed',
+                approach_success=True,
+                contact_detected=True,
+                grasp_active=False,
+                constraint_available=(
+                    constraint_available
+                ),
+                lower_step_count=(
+                    lower_step_count
+                ),
+            )
             self.ee.release()
             retreat = approach.copy()
             retreat[2] = retreat_z
             self.movep(retreat, speed=speed)
             return False
+
+        record_acquisition(
+            success=True,
+            failure_reason=None,
+            approach_success=True,
+            contact_detected=True,
+            grasp_active=True,
+            constraint_available=(
+                constraint_available
+            ),
+            lower_step_count=(
+                lower_step_count
+            ),
+        )
 
         grasp_tip = np.asarray(
             p.getLinkState(
