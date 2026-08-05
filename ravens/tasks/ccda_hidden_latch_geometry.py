@@ -22,8 +22,11 @@ class HiddenLatchGeometryConfig:
     workspace_x: Sequence[float]
     workspace_y: Sequence[float]
     bead_radius: float = 0.005
+    topology_id: str = "delayed_z_latch_v1"
 
     def __post_init__(self):
+        if not str(self.topology_id).strip():
+            raise ValueError("topology_id must be non-empty")
         if not 0.0 <= float(self.center_ratio) <= 1.0:
             raise ValueError("center_ratio must lie in [0,1]")
         for name in (
@@ -295,7 +298,7 @@ def compute_hidden_latch_layout(
     anchor = selected["anchor"]
     return {
         "snapshot_version": "ccda_hidden_latch_layout_v1",
-        "topology": "delayed_z_latch_v1",
+        "topology": str(config.topology_id),
         "probe_index": int(selected["probe_index"]),
         "endpoint_index": int(selected["endpoint_index"]),
         "normal_sign": float(selected["normal_sign"]),

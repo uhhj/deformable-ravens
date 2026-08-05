@@ -1,6 +1,7 @@
 """Fixed invisible delayed Z-latch cable task for Phase 0I smoke."""
 from __future__ import annotations
 
+import os
 import numpy as np
 import pybullet as p
 
@@ -21,6 +22,10 @@ class CCDAHiddenLatchCable(CCDAHiddenHookCable):
 
     def _latch_config(self):
         return HiddenLatchGeometryConfig(
+            topology_id=os.environ.get(
+                "CCDA_LATCH_TOPOLOGY_ID",
+                "delayed_z_latch_v1",
+            ),
             center_ratio=self._env_float("CCDA_LATCH_CENTER_RATIO", "0.45"),
             stop_clearance=self._env_float("CCDA_LATCH_STOP_CLEARANCE", "0.002"),
             roof_clearance=self._env_float("CCDA_LATCH_ROOF_CLEARANCE", "0.002"),
@@ -96,11 +101,15 @@ class CCDAHiddenLatchCable(CCDAHiddenHookCable):
 
     def ccda_privileged_state(self):
         state = super().ccda_privileged_state()
+        layout = state.pop("hook_layout")
+        topology = str(
+            layout.get("topology", "delayed_z_latch_v1")
+        )
         state.update({
             "environment_version": self.ENVIRONMENT_VERSION,
             "hidden_factor": "invisible_z_latch",
-            "topology": "delayed_z_latch_v1",
-            "latch_layout": state.pop("hook_layout"),
+            "topology": topology,
+            "latch_layout": layout,
             "latch_body_ids": state.pop("hook_body_ids"),
             "latch_collision_enabled": state.pop("hook_collision_enabled"),
             "latch_initial_clearance": state.pop("hook_initial_clearance"),

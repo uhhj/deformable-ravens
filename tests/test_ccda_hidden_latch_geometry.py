@@ -46,3 +46,21 @@ def test_invalid_latch_dimensions_fail():
         HiddenLatchGeometryConfig(**values)
     with pytest.raises(ValueError):
         compute_hidden_latch_layout(np.zeros((2, 3)), config())
+
+
+def test_named_wide_stop_topology_changes_only_reported_name_and_width():
+    values = config().__dict__.copy()
+    values.update(topology_id="wide_stop_z_latch_v2", wall_width=0.080)
+    layout = compute_hidden_latch_layout(
+        beads(), HiddenLatchGeometryConfig(**values)
+    )
+    assert layout["topology"] == "wide_stop_z_latch_v2"
+    stop = next(box for box in layout["boxes"] if box["name"] == "stop_wall")
+    assert stop["half_extents"][0] == 0.040
+
+
+def test_empty_topology_name_fails():
+    values = config().__dict__.copy()
+    values["topology_id"] = "  "
+    with pytest.raises(ValueError, match="topology_id"):
+        HiddenLatchGeometryConfig(**values)
