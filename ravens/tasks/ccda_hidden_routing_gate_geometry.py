@@ -1,7 +1,8 @@
 """Pure geometry for the fixed hidden routing-gate cable task."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Sequence
 
 import numpy as np
@@ -109,6 +110,21 @@ class HiddenRoutingGateGeometryConfig:
                 or values[0] >= values[1]
             ):
                 raise ValueError(f"invalid {name}")
+
+
+class HiddenRoutingGateGeometryError(RuntimeError):
+    """No legal fixed routing geometry, with complete provenance."""
+
+    def __init__(self, message, diagnostics):
+        super().__init__(str(message))
+        self.diagnostics = diagnostics
+
+    def to_dict(self):
+        return {
+            "exception_type": type(self).__name__,
+            "message": str(self),
+            "diagnostics": self.diagnostics,
+        }
 
 
 def _normalize(value) -> np.ndarray:
@@ -247,33 +263,55 @@ def _leading_indices(
     )
 
 
-def public_routing_layout(
-    layout: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Strip all hidden fixture geometry from a layout."""
-    public = dict(layout["public_task"])
-    forbidden = {
-        key
-        for key in public
-        if (
-            "barrier" in str(key).lower()
-            or "roof" in str(key).lower()
-            or "hidden" in str(key).lower()
-            or "box" in str(key).lower()
+def _margin_for_points(
+    points,
+    x_bounds,
+    y_bounds,
+):
+    values = list(points)
+    if not values:
+        raise ValueError(
+            "workspace margin point set is empty"
         )
-    }
-    if forbidden:
-        raise RuntimeError(
-            "public routing layout leaks hidden keys: "
-            f"{sorted(forbidden)}"
-        )
-    return public
+    return _workspace_margin(
+        values,
+        x_bounds,
+        y_bounds,
+    )
 
 
-def compute_hidden_routing_gate_layout(
+def _json_float(value):
+    value = float(value)
+    if not np.isfinite(value):
+        raise ValueError(
+            "geometry diagnostic is non-finite"
+        )
+    return value
+
+
+def _candidate_rejection_reasons(row):
+    reasons = []
+    if row["coverage_margin"] <= 0:
+        reasons.append("barrier_coverage")
+    if row["workspace_margin"] <= 0:
+        reasons.append("workspace")
+    if (
+        row["minimum_clearance"] + 1e-9
+        < row["expected_minimum_clearance"]
+    ):
+        reasons.append("initial_clearance")
+    return reasons
+
+
+def evaluate_hidden_routing_gate_candidates(
     bead_positions: np.ndarray,
     config: HiddenRoutingGateGeometryConfig,
 ) -> Dict[str, Any]:
+    """Evaluate all four fixed endpoint/sign candidates.
+
+    This function never discards a candidate without recording why.
+    It performs no search over task parameters.
+    """
     beads = np.asarray(
         bead_positions,
         dtype=np.float64,
@@ -332,7 +370,7 @@ def compute_hidden_routing_gate_layout(
     )
     construction_epsilon = 5e-5
 
-    candidates: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
 
     for endpoint_index in (
         0,
@@ -344,6 +382,19 @@ def compute_hidden_routing_gate_layout(
             if endpoint_index == 0
             else -endpoint_axis
         )
+        tangent_projection = (
+            beads[:, :2] @ tangent
+        )
+        tangent_min = float(
+            np.min(tangent_projection)
+        )
+        tangent_max = float(
+            np.max(tangent_projection)
+        )
+        tangent_midpoint = 0.5 * (
+            tangent_min + tangent_max
+        )
+
         for normal_sign in (-1.0, 1.0):
             normal = (
                 normal_sign * base_normal
@@ -361,8 +412,6 @@ def compute_hidden_routing_gate_layout(
                 )
             )
 
-            # Preserve the endpoint's normal coordinate,
-            # but center the barrier along the cable tangent.
             endpoint_from_centroid = (
                 endpoint[:2] - centroid
             )
@@ -387,28 +436,54 @@ def compute_hidden_routing_gate_layout(
                     config.barrier_height / 2
                 ),
                 "half_extents": [
-                    float(config.barrier_width / 2),
+                    float(
+                        config.barrier_width / 2
+                    ),
                     float(
                         config.barrier_thickness / 2
                     ),
-                    float(config.barrier_height / 2),
+                    float(
+                        config.barrier_height / 2
+                    ),
                 ],
                 "yaw": yaw_tangent,
             }
 
+            centered_tangent_coordinate = float(
+                np.dot(
+                    barrier_center,
+                    tangent,
+                )
+            )
+            tangent_center_error = float(
+                centered_tangent_coordinate
+                - tangent_midpoint
+            )
             tangent_coordinates = (
                 beads[:, :2]
                 - barrier_center.reshape(1, 2)
             ) @ tangent
-            coverage_margin = float(
-                config.barrier_width / 2
-                - np.max(
+            max_abs_tangent_coordinate = float(
+                np.max(
                     np.abs(tangent_coordinates)
                 )
+            )
+            required_barrier_width = float(
+                2.0 * (
+                    max_abs_tangent_coordinate
+                    + bounding_radius
+                )
+            )
+            optimally_centered_required_width = float(
+                tangent_max
+                - tangent_min
+                + 2.0 * bounding_radius
+            )
+            coverage_margin = float(
+                config.barrier_width / 2
+                - max_abs_tangent_coordinate
                 - bounding_radius
             )
-            if coverage_margin <= 0:
-                continue
 
             probe_index = preferred_probe
             probe = beads[probe_index]
@@ -461,31 +536,61 @@ def compute_hidden_routing_gate_layout(
             target_zone_center = (
                 target_plane_point
                 + normal
-                * (config.target_zone_depth / 2)
+                * (
+                    config.target_zone_depth / 2
+                )
+            )
+            target_zone_corners = (
+                _rectangle_corners(
+                    target_zone_center,
+                    normal,
+                    tangent,
+                    (
+                        config.target_zone_depth
+                        / 2
+                    ),
+                    (
+                        config
+                        .target_corridor_half_width
+                    ),
+                )
             )
 
-            target_zone_corners = _rectangle_corners(
-                target_zone_center,
-                normal,
-                tangent,
-                config.target_zone_depth / 2,
-                config.target_corridor_half_width,
-            )
-            points = [
-                stage1_target,
-                final_target,
-                target_plane_point,
-            ]
-            points.extend(_box_corners(barrier))
-            points.extend(_box_corners(probe_roof))
-            points.extend(target_zone_corners)
-            workspace_margin = _workspace_margin(
-                points,
-                x_bounds,
-                y_bounds,
-            )
-            if workspace_margin <= 0:
-                continue
+            component_workspace_margin = {
+                "stage1_target": _margin_for_points(
+                    [stage1_target],
+                    x_bounds,
+                    y_bounds,
+                ),
+                "final_target": _margin_for_points(
+                    [final_target],
+                    x_bounds,
+                    y_bounds,
+                ),
+                "target_plane": _margin_for_points(
+                    [target_plane_point],
+                    x_bounds,
+                    y_bounds,
+                ),
+                "routing_barrier": _margin_for_points(
+                    _box_corners(barrier),
+                    x_bounds,
+                    y_bounds,
+                ),
+                "probe_roof": _margin_for_points(
+                    _box_corners(probe_roof),
+                    x_bounds,
+                    y_bounds,
+                ),
+                "target_zone": _margin_for_points(
+                    target_zone_corners,
+                    x_bounds,
+                    y_bounds,
+                ),
+            }
+            workspace_margin = float(min(
+                component_workspace_margin.values()
+            ))
 
             barrier_surface_clearance = min(
                 _point_box_distance(
@@ -501,23 +606,18 @@ def compute_hidden_routing_gate_layout(
                 )
                 - config.bead_radius
             )
-            minimum_clearance = min(
+            minimum_clearance = float(min(
                 barrier_surface_clearance,
                 roof_surface_clearance,
-            )
-            expected_minimum = min(
+            ))
+            expected_minimum = float(min(
                 config.probe_roof_clearance,
                 (
                     config.barrier_offset
                     - config.barrier_thickness / 2
                     - bounding_radius
                 ),
-            )
-            if (
-                minimum_clearance + 1e-9
-                < expected_minimum
-            ):
-                continue
+            ))
 
             leading = _leading_indices(
                 beads.shape[0],
@@ -532,7 +632,9 @@ def compute_hidden_routing_gate_layout(
                 "topology_id": str(
                     config.topology_id
                 ),
-                "probe_index": int(probe_index),
+                "probe_index": int(
+                    probe_index
+                ),
                 "endpoint_index": int(
                     endpoint_index
                 ),
@@ -561,8 +663,11 @@ def compute_hidden_routing_gate_layout(
                     .astype(float)
                     .tolist()
                 ),
-                "target_corridor_half_width": float(
-                    config.target_corridor_half_width
+                "target_corridor_half_width": (
+                    float(
+                        config
+                        .target_corridor_half_width
+                    )
                 ),
                 "target_zone_center_xy": (
                     target_zone_center
@@ -574,66 +679,271 @@ def compute_hidden_routing_gate_layout(
                 ),
                 "target_zone_half_extents_xy": [
                     float(
-                        config.target_zone_depth / 2
+                        config.target_zone_depth
+                        / 2
                     ),
                     float(
-                        config.target_corridor_half_width
+                        config
+                        .target_corridor_half_width
                     ),
                 ],
                 "target_zone_yaw": yaw_normal,
             }
-            candidates.append({
-                "endpoint_index": endpoint_index,
-                "normal_sign": normal_sign,
-                "probe_index": probe_index,
+
+            row = {
+                "endpoint_index": int(
+                    endpoint_index
+                ),
+                "normal_sign": float(
+                    normal_sign
+                ),
+                "probe_index": int(
+                    probe_index
+                ),
+                "normal_xy": (
+                    normal.astype(float).tolist()
+                ),
+                "tangent_xy": (
+                    tangent.astype(float).tolist()
+                ),
+                "tangent_projection_min": (
+                    _json_float(tangent_min)
+                ),
+                "tangent_projection_max": (
+                    _json_float(tangent_max)
+                ),
+                "tangent_projection_midpoint": (
+                    _json_float(
+                        tangent_midpoint
+                    )
+                ),
+                "barrier_center_tangent_coordinate": (
+                    _json_float(
+                        centered_tangent_coordinate
+                    )
+                ),
+                "barrier_tangent_center_error": (
+                    _json_float(
+                        tangent_center_error
+                    )
+                ),
+                "max_abs_tangent_coordinate": (
+                    _json_float(
+                        max_abs_tangent_coordinate
+                    )
+                ),
+                "configured_barrier_width": (
+                    _json_float(
+                        config.barrier_width
+                    )
+                ),
+                "required_barrier_width": (
+                    _json_float(
+                        required_barrier_width
+                    )
+                ),
+                "optimally_centered_required_width": (
+                    _json_float(
+                        optimally_centered_required_width
+                    )
+                ),
+                "barrier_width_shortfall": (
+                    _json_float(
+                        max(
+                            0.0,
+                            required_barrier_width
+                            - config.barrier_width,
+                        )
+                    )
+                ),
+                "coverage_margin": (
+                    _json_float(
+                        coverage_margin
+                    )
+                ),
+                "workspace_margin": (
+                    _json_float(
+                        workspace_margin
+                    )
+                ),
+                "component_workspace_margin": {
+                    key: _json_float(value)
+                    for key, value
+                    in component_workspace_margin.items()
+                },
+                "barrier_surface_clearance": (
+                    _json_float(
+                        barrier_surface_clearance
+                    )
+                ),
+                "probe_roof_surface_clearance": (
+                    _json_float(
+                        roof_surface_clearance
+                    )
+                ),
+                "minimum_clearance": (
+                    _json_float(
+                        minimum_clearance
+                    )
+                ),
+                "expected_minimum_clearance": (
+                    _json_float(
+                        expected_minimum
+                    )
+                ),
                 "public_task": public_task,
                 "boxes": [
                     probe_roof,
                     barrier,
                 ],
-                "workspace_margin": (
-                    workspace_margin
+                "roof_bottom_z": (
+                    _json_float(
+                        roof_bottom
+                    )
                 ),
-                "coverage_margin": coverage_margin,
-                "minimum_clearance": (
-                    minimum_clearance
-                ),
-                "barrier_surface_clearance": (
-                    barrier_surface_clearance
-                ),
-                "roof_surface_clearance": (
-                    roof_surface_clearance
-                ),
-                "roof_bottom_z": roof_bottom,
-            })
+            }
+            reasons = (
+                _candidate_rejection_reasons(
+                    row
+                )
+            )
+            row["rejection_reasons"] = reasons
+            row["accepted"] = not reasons
+            rows.append(row)
 
-    if not candidates:
+    rejection_counts = Counter(
+        reason
+        for row in rows
+        for reason in row[
+            "rejection_reasons"
+        ]
+    )
+    accepted = [
+        row
+        for row in rows
+        if row["accepted"]
+    ]
+    return {
+        "audit_version": (
+            "hidden_routing_gate_"
+            "geometry_audit_v1"
+        ),
+        "topology_id": str(
+            config.topology_id
+        ),
+        "config": asdict(config),
+        "bead_count": int(
+            beads.shape[0]
+        ),
+        "bead_positions_xyz": (
+            beads.astype(float).tolist()
+        ),
+        "ordered_endpoint_center_span": float(
+            np.linalg.norm(
+                beads[-1, :2]
+                - beads[0, :2]
+            )
+        ),
+        "bead_collision_bounding_radius": (
+            bounding_radius
+        ),
+        "candidate_count": len(rows),
+        "accepted_candidate_count": len(
+            accepted
+        ),
+        "rejection_counts": {
+            str(key): int(value)
+            for key, value
+            in sorted(
+                rejection_counts.items()
+            )
+        },
+        "candidates": rows,
+    }
+
+
+def public_routing_layout(
+    layout: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Strip all hidden fixture geometry from a layout."""
+    public = dict(layout["public_task"])
+    forbidden = {
+        key
+        for key in public
+        if (
+            "barrier" in str(key).lower()
+            or "roof" in str(key).lower()
+            or "hidden" in str(key).lower()
+            or "box" in str(key).lower()
+        )
+    }
+    if forbidden:
         raise RuntimeError(
-            "no legal fixed hidden routing-gate "
-            "orientation and endpoint"
+            "public routing layout leaks hidden keys: "
+            f"{sorted(forbidden)}"
+        )
+    return public
+
+
+def compute_hidden_routing_gate_layout(
+    bead_positions: np.ndarray,
+    config: HiddenRoutingGateGeometryConfig,
+) -> Dict[str, Any]:
+    audit = (
+        evaluate_hidden_routing_gate_candidates(
+            bead_positions,
+            config,
+        )
+    )
+    candidates = [
+        row
+        for row in audit["candidates"]
+        if row["accepted"]
+    ]
+    if not candidates:
+        raise HiddenRoutingGateGeometryError(
+            (
+                "no legal fixed hidden "
+                "routing-gate orientation "
+                "and endpoint"
+            ),
+            audit,
         )
 
     selected = max(
         candidates,
         key=lambda item: (
             round(
-                float(item["workspace_margin"]),
+                float(
+                    item["workspace_margin"]
+                ),
                 12,
             ),
             round(
-                float(item["coverage_margin"]),
+                float(
+                    item["coverage_margin"]
+                ),
                 12,
             ),
-            -int(item["endpoint_index"]),
-            float(item["normal_sign"]),
+            -int(
+                item["endpoint_index"]
+            ),
+            float(
+                item["normal_sign"]
+            ),
         ),
     )
     return {
         "snapshot_version": (
-            "ccda_hidden_routing_gate_layout_v1"
+            "ccda_hidden_routing_gate_"
+            "layout_v1r1"
         ),
-        "topology": str(config.topology_id),
-        "public_task": selected["public_task"],
+        "topology": str(
+            config.topology_id
+        ),
+        "public_task": (
+            selected["public_task"]
+        ),
         "probe_index": int(
             selected["probe_index"]
         ),
@@ -646,27 +956,66 @@ def compute_hidden_routing_gate_layout(
         "roof_bottom_z": float(
             selected["roof_bottom_z"]
         ),
-        "bead_collision_half_extent": float(
-            config.bead_radius
+        "bead_collision_half_extent": (
+            float(config.bead_radius)
         ),
-        "bead_collision_bounding_radius": float(
-            bounding_radius
+        "bead_collision_bounding_radius": (
+            float(
+                audit[
+                    "bead_collision_bounding_radius"
+                ]
+            )
         ),
-        "barrier_tangent_coverage_margin": float(
-            selected["coverage_margin"]
+        "barrier_tangent_coverage_margin": (
+            float(
+                selected["coverage_margin"]
+            )
+        ),
+        "barrier_required_width": float(
+            selected[
+                "required_barrier_width"
+            ]
+        ),
+        "barrier_width_shortfall": float(
+            selected[
+                "barrier_width_shortfall"
+            ]
+        ),
+        "barrier_tangent_center_error": float(
+            selected[
+                "barrier_tangent_center_error"
+            ]
         ),
         "barrier_surface_clearance": float(
-            selected["barrier_surface_clearance"]
+            selected[
+                "barrier_surface_clearance"
+            ]
         ),
-        "probe_roof_surface_clearance": float(
-            selected["roof_surface_clearance"]
+        "probe_roof_surface_clearance": (
+            float(
+                selected[
+                    "probe_roof_surface_clearance"
+                ]
+            )
         ),
-        "expected_surface_clearance": float(
-            selected["minimum_clearance"]
+        "expected_surface_clearance": (
+            float(
+                selected[
+                    "minimum_clearance"
+                ]
+            )
         ),
         "workspace_margin": float(
             selected["workspace_margin"]
         ),
+        "component_workspace_margin": (
+            selected[
+                "component_workspace_margin"
+            ]
+        ),
         "boxes": selected["boxes"],
+        # Privileged engineering provenance only.
+        # public_routing_layout() never exposes it.
+        "geometry_audit": audit,
     }
 
