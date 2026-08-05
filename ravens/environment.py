@@ -53,7 +53,8 @@ class Environment():
                            'pick_probe_return': self.pick_probe_return,
                            'pick_planar_microprobe': self.pick_planar_microprobe,
                            'pick_precise_probe_return': self.pick_precise_probe_return,
-                           'pick_precise_latch_probe': self.pick_precise_latch_probe}
+                           'pick_precise_latch_probe': self.pick_precise_latch_probe,
+                           'pick_precise_tension_extension': self.pick_precise_tension_extension}
 
         self._ccda_video_recorder = None
         self._ccda_video_label = ""
@@ -1591,6 +1592,188 @@ class Environment():
 
         retreat = release_pose.copy()
         retreat[2] = float(retreat_z)
+        success &= self.movep(retreat, speed=speed)
+        return bool(success)
+
+    def pick_precise_tension_extension(
+            self,
+            pose0,
+            pose_stage1,
+            pose1,
+            lift_height=0.004,
+            approach_height=0.02,
+            retreat_z=0.3,
+            joint_tolerance=1e-4,
+            cartesian_tolerance=2e-4,
+            min_achieved_fraction=0.8):
+        """One grasp, two collinear waypoints, then release."""
+        if not self.deterministic:
+            raise RuntimeError(
+                'pick_precise_tension_extension requires fixed-step mode'
+            )
+
+        lift_height = float(lift_height)
+        approach_height = float(approach_height)
+        retreat_z = float(retreat_z)
+        joint_tolerance = float(joint_tolerance)
+        cartesian_tolerance = float(cartesian_tolerance)
+        min_achieved_fraction = float(min_achieved_fraction)
+        if lift_height <= 0:
+            raise ValueError('lift_height must be positive')
+        if approach_height <= lift_height:
+            raise ValueError('approach_height must exceed lift_height')
+        if retreat_z <= 0:
+            raise ValueError('retreat_z must be positive')
+        if joint_tolerance <= 0:
+            raise ValueError('joint_tolerance must be positive')
+        if cartesian_tolerance <= 0:
+            raise ValueError('cartesian_tolerance must be positive')
+        if not 0 < min_achieved_fraction <= 1:
+            raise ValueError('min_achieved_fraction must be in (0,1]')
+
+        primitive = 'pick_precise_tension_extension'
+        speed = 0.001
+        delta_z = -0.0005
+        if hasattr(self.task, 'primitive_params'):
+            params = self.task.primitive_params[self.task.task_stage]
+            speed = float(params.get('speed', speed))
+            delta_z = float(params.get('delta_z', delta_z))
+        if delta_z >= 0:
+            raise ValueError('tension extension delta_z must be negative')
+
+        deformable_ids = getattr(self.task, 'def_IDs', [])
+        pick = np.asarray(pose0[0], dtype=np.float64)
+        stage1 = np.asarray(pose_stage1[0], dtype=np.float64)
+        final = np.asarray(pose1[0], dtype=np.float64)
+        rotation = np.asarray(pose0[1], dtype=np.float64)
+        for name, value in (
+                ('pick', pick), ('stage1', stage1), ('final', final)):
+            if value.shape != (3,):
+                raise ValueError('{} position must be XYZ'.format(name))
+            if not np.all(np.isfinite(value)):
+                raise ValueError('{} position is non-finite'.format(name))
+
+        stage1_vector = stage1[:2] - pick[:2]
+        final_vector = final[:2] - pick[:2]
+        stage1_distance = float(np.linalg.norm(stage1_vector))
+        final_distance = float(np.linalg.norm(final_vector))
+        if stage1_distance <= 1e-12:
+            raise ValueError('stage-1 displacement is zero')
+        if final_distance <= stage1_distance:
+            raise ValueError('final displacement must exceed stage 1')
+        stage1_direction = stage1_vector / stage1_distance
+        final_direction = final_vector / final_distance
+        if float(np.linalg.norm(stage1_direction - final_direction)) > 1e-9:
+            raise ValueError('stage-1 and final pulls must be collinear')
+
+        success = True
+        approach = np.hstack((
+            [pick[0], pick[1], pick[2] + approach_height], rotation
+        ))
+        success &= self.movep(approach, speed=speed)
+        lower = approach.copy()
+        floor_limit = max(0.0, float(pick[2]) - 0.01)
+        while (
+                not self.ee.detect_contact(deformable_ids)
+                and lower[2] > floor_limit):
+            lower[2] += delta_z
+            success &= self.movep(
+                lower, speed=speed, joint_tolerance=joint_tolerance
+            )
+            if not success:
+                return False
+
+        self.ee.activate(self.objects, deformable_ids)
+        if not self.ee.check_grasp():
+            self.ee.release()
+            retreat = approach.copy()
+            retreat[2] = retreat_z
+            self.movep(retreat, speed=speed)
+            return False
+
+        grasp_tip = np.asarray(
+            p.getLinkState(
+                self.ur5, self.ee_tip_link, computeForwardKinematics=True
+            )[0],
+            dtype=np.float64,
+        )
+        pull_z = float(grasp_tip[2] + lift_height)
+
+        def precise_move(target, label):
+            nonlocal success
+            success &= self.movep_precise(
+                target,
+                speed=speed,
+                joint_tolerance=joint_tolerance,
+                cartesian_tolerance=cartesian_tolerance,
+                label=label,
+                primitive=primitive,
+            )
+            event = self._ccda_motion_events[-1]
+            grasp_active = bool(self.ee.check_grasp())
+            event['grasp_active_after'] = grasp_active
+            event['constraint_available_after'] = bool(
+                getattr(self.ee, 'contact_constraint', None) is not None
+            )
+            if float(event['achieved_fraction']) < min_achieved_fraction:
+                success = False
+            if not grasp_active:
+                success = False
+            return grasp_active
+
+        lift = np.hstack((
+            [grasp_tip[0], grasp_tip[1], pull_z], rotation
+        ))
+        if not precise_move(lift, 'tension_pull_lift'):
+            self.ee.release()
+            return False
+
+        stage1_delta = stage1[:2] - pick[:2]
+        stage1_pose = np.hstack((
+            [
+                grasp_tip[0] + stage1_delta[0],
+                grasp_tip[1] + stage1_delta[1],
+                pull_z,
+            ],
+            rotation,
+        ))
+        if not precise_move(stage1_pose, 'tension_pull_stage1'):
+            self.ee.release()
+            return False
+
+        final_delta = final[:2] - pick[:2]
+        final_pose = np.hstack((
+            [
+                grasp_tip[0] + final_delta[0],
+                grasp_tip[1] + final_delta[1],
+                pull_z,
+            ],
+            rotation,
+        ))
+        if not precise_move(final_pose, 'tension_pull_stage2'):
+            self.ee.release()
+            return False
+
+        release_pose = final_pose.copy()
+        release_pose[2] = float(grasp_tip[2])
+        success &= self.movep_precise(
+            release_pose,
+            speed=speed,
+            joint_tolerance=joint_tolerance,
+            cartesian_tolerance=cartesian_tolerance,
+            label='tension_pull_lower_release',
+            primitive=primitive,
+        )
+        release_event = self._ccda_motion_events[-1]
+        release_event['grasp_active_before_release'] = bool(
+            self.ee.check_grasp()
+        )
+        if float(release_event['achieved_fraction']) < min_achieved_fraction:
+            success = False
+
+        self.ee.release()
+        retreat = release_pose.copy()
+        retreat[2] = retreat_z
         success &= self.movep(retreat, speed=speed)
         return bool(success)
 
