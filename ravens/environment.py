@@ -237,6 +237,38 @@ class Environment():
         self._ccda_video_recorder = recorder
         self._ccda_video_label = ""
 
+    @staticmethod
+    def _ccda_execution_status(
+            *,
+            action_executed,
+            action_completed,
+            primitive_succeeded,
+            task_success,
+            episode_terminated,
+            termination_reason):
+        return {
+            'action_executed': bool(
+                action_executed
+            ),
+            'action_completed': bool(
+                action_completed
+            ),
+            'primitive_succeeded': (
+                None
+                if primitive_succeeded is None
+                else bool(primitive_succeeded)
+            ),
+            'task_success': bool(
+                task_success
+            ),
+            'episode_terminated': bool(
+                episode_terminated
+            ),
+            'termination_reason': (
+                termination_reason
+            ),
+        }
+
     def reset_ccda_motion_events(self):
         self._ccda_motion_events = []
 
@@ -525,31 +557,95 @@ class Environment():
         with ground truth agents, there is no 'second action lacking a primitive',
         because ground truth agents don't need images (see their `act` method).
         """
-        action_executed = bool(act and act['primitive'])
+        action_executed = bool(
+            act and act['primitive']
+        )
+        primitive_succeeded = None
+
         if action_executed:
-            success = self.primitives[act['primitive']](**act['params'])
+            primitive_succeeded = bool(
+                self.primitives[
+                    act['primitive']
+                ](**act['params'])
+            )
 
-            # Exit early if action failed. Daniel: adding exit_gracefully.
-            if (not success) or self.task.exit_gracefully:
-                _, reward_extras = self.task.reward()
+            exit_gracefully = bool(
+                self.task.exit_gracefully
+            )
+            if (
+                    not primitive_succeeded
+                    or exit_gracefully):
+                _, reward_extras = (
+                    self.task.reward()
+                )
                 info = self.info
-                reward_extras['task.done'] = False
+                reward_extras[
+                    'task.done'
+                ] = False
 
-                # Means we hit irrecoverable action, exit now (reset to False!!).
-                if self.task.exit_gracefully:
-                    reward_extras['exit_gracefully'] = True
-                    self.task.exit_gracefully = False  # important !!!
+                if exit_gracefully:
+                    reward_extras[
+                        'exit_gracefully'
+                    ] = True
+                    self.task.exit_gracefully = (
+                        False
+                    )
 
-                # For consistency?
-                if isinstance(self.task, tasks.names['cloth-flat-notarget']):
-                    info['sampled_zone_pose'] = self.task.zone_pose
-                elif isinstance(self.task, tasks.names['bag-color-goal']):
-                    info['bag_base_pos'] = self.task.bag_base_pos[0]
-                    info['bag_base_orn'] = self.task.bag_base_orn[0]
-                    info['bag_target_color'] = self.task.bag_colors[0]
+                termination_reason = (
+                    'primitive_failed'
+                    if not primitive_succeeded
+                    else 'task_exit_gracefully'
+                )
+                status = (
+                    self._ccda_execution_status(
+                        action_executed=True,
+                        action_completed=True,
+                        primitive_succeeded=(
+                            primitive_succeeded
+                        ),
+                        task_success=False,
+                        episode_terminated=True,
+                        termination_reason=(
+                            termination_reason
+                        ),
+                    )
+                )
+
+                if isinstance(
+                        self.task,
+                        tasks.names[
+                            'cloth-flat-notarget'
+                        ]):
+                    info[
+                        'sampled_zone_pose'
+                    ] = self.task.zone_pose
+                elif isinstance(
+                        self.task,
+                        tasks.names[
+                            'bag-color-goal'
+                        ]):
+                    info[
+                        'bag_base_pos'
+                    ] = self.task.bag_base_pos[0]
+                    info[
+                        'bag_base_orn'
+                    ] = self.task.bag_base_orn[0]
+                    info[
+                        'bag_target_color'
+                    ] = self.task.bag_colors[0]
 
                 info['extras'] = reward_extras
-                return {}, 0, True, info
+                info[
+                    'ccda_execution_status'
+                ] = status
+                return (
+                    {},
+                    0,
+                    status[
+                        'episode_terminated'
+                    ],
+                    info,
+                )
 
         if self.deterministic:
             # Do not wait on a velocity predicate: hidden contact conditions
@@ -565,23 +661,69 @@ class Environment():
                     break
                 time.sleep(0.001)
 
-        # Compute task rewards.
-        reward, reward_extras = self.task.reward()
-        done = self.task.done()
+        reward, reward_extras = (
+            self.task.reward()
+        )
+        task_success = bool(
+            self.task.done()
+        )
+        episode_terminated = bool(
+            task_success
+        )
+        termination_reason = (
+            'task_success'
+            if task_success
+            else None
+        )
 
-        # Pass ground truth robot state as info.
+        status = self._ccda_execution_status(
+            action_executed=action_executed,
+            action_completed=action_executed,
+            primitive_succeeded=(
+                True
+                if action_executed
+                else None
+            ),
+            task_success=task_success,
+            episode_terminated=(
+                episode_terminated
+            ),
+            termination_reason=(
+                termination_reason
+            ),
+        )
+
         info = self.info
-
-        # Daniel: fine-grained info about rewards (since it's nuanced for some tasks).
-        # If we hit time limit, `task.done` will check if we succeeded on last action.
-        reward_extras['task.done'] = done
+        reward_extras[
+            'task.done'
+        ] = task_success
         info['extras'] = reward_extras
-        if isinstance(self.task, tasks.names['cloth-flat-notarget']):
-            info['sampled_zone_pose'] = self.task.zone_pose
-        elif isinstance(self.task, tasks.names['bag-color-goal']):
-            info['bag_base_pos'] = self.task.bag_base_pos[0]
-            info['bag_base_orn'] = self.task.bag_base_orn[0]
-            info['bag_target_color'] = self.task.bag_colors[0]
+        info[
+            'ccda_execution_status'
+        ] = status
+
+        if isinstance(
+                self.task,
+                tasks.names[
+                    'cloth-flat-notarget'
+                ]):
+            info[
+                'sampled_zone_pose'
+            ] = self.task.zone_pose
+        elif isinstance(
+                self.task,
+                tasks.names[
+                    'bag-color-goal'
+                ]):
+            info[
+                'bag_base_pos'
+            ] = self.task.bag_base_pos[0]
+            info[
+                'bag_base_orn'
+            ] = self.task.bag_base_orn[0]
+            info[
+                'bag_target_color'
+            ] = self.task.bag_colors[0]
 
         # Get camera observations per specified config.
         obs = {}
@@ -592,7 +734,12 @@ class Environment():
                 obs['color'].append(color)
                 obs['depth'].append(depth)
 
-        return obs, reward, done, info
+        return (
+            obs,
+            reward,
+            status['episode_terminated'],
+            info,
+        )
 
     def render(self, config):
         """Render RGB-D image with specified configuration."""
@@ -1485,7 +1632,24 @@ class Environment():
             retreat_z=0.3,
             joint_tolerance=1e-4,
             cartesian_tolerance=2e-4,
-            min_achieved_fraction=0.8):
+            min_achieved_fraction=0.8,
+            acquisition_motion_mode=(
+                'legacy_joint_return'
+            )):
+        acquisition_motion_mode = str(
+            acquisition_motion_mode
+        )
+        if acquisition_motion_mode not in {
+                'legacy_joint_return',
+                'precise_endpoint_recovery'}:
+            raise ValueError(
+                'unsupported acquisition_motion_mode '
+                f'{acquisition_motion_mode!r}'
+            )
+        precise_acquisition = (
+            acquisition_motion_mode
+            == 'precise_endpoint_recovery'
+        )
         if not self.deterministic:
             raise RuntimeError('pick_precise_latch_probe requires fixed-step mode')
         if lift_height <= 0:
@@ -1503,6 +1667,98 @@ class Environment():
         if delta_z >= 0:
             raise ValueError('delta_z must be negative')
 
+        counter = getattr(
+            self.task,
+            'physics_step_count',
+            None,
+        )
+        if (
+                precise_acquisition
+                and not callable(counter)):
+            raise RuntimeError(
+                'routing probe task has no '
+                'physics step counter'
+            )
+        if not callable(counter):
+            counter = lambda: 0
+
+        acquisition_step_start = int(
+            counter()
+        )
+
+        def record_probe_acquisition(
+                *,
+                success,
+                failure_reason,
+                approach_success,
+                contact_detected,
+                grasp_active,
+                constraint_available,
+                lower_step_count):
+            physics_step_end = int(
+                counter()
+            )
+            event = {
+                'primitive': primitive,
+                'stage': (
+                    'routing_probe_acquisition'
+                ),
+                'label': (
+                    'routing_probe_acquisition'
+                ),
+                'success': bool(success),
+                'failure_reason': (
+                    failure_reason
+                ),
+                'approach_success': bool(
+                    approach_success
+                ),
+                'contact_detected': bool(
+                    contact_detected
+                ),
+                'grasp_active_after': bool(
+                    grasp_active
+                ),
+                'constraint_available_after': bool(
+                    constraint_available
+                ),
+                'lower_step_count': int(
+                    lower_step_count
+                ),
+                'physics_step_start': (
+                    acquisition_step_start
+                ),
+                'physics_step_end': (
+                    physics_step_end
+                ),
+                'physics_step_count': int(
+                    physics_step_end
+                    - acquisition_step_start
+                ),
+                'achieved_fraction': (
+                    1.0 if success else 0.0
+                ),
+                'joint_motion_success': bool(
+                    approach_success
+                    and failure_reason
+                    not in {
+                        'approach_motion_failed',
+                        'contact_lowering_failed',
+                    }
+                ),
+                'joint_timeout_count': 0,
+                'timeout_reason': (
+                    None
+                    if success
+                    else failure_reason
+                ),
+            }
+            if precise_acquisition:
+                self._ccda_motion_events.append(
+                    event
+                )
+            return event
+
         deformable_ids = getattr(self.task, 'def_IDs', [])
         pick = np.asarray(pose0[0], dtype=np.float64)
         rotation = np.asarray(pose0[1], dtype=np.float64)
@@ -1510,22 +1766,175 @@ class Environment():
         approach = np.hstack((
             [pick[0], pick[1], pick[2] + approach_height], rotation
         ))
-        success &= self.movep(approach, speed=speed)
+
+        if precise_acquisition:
+            approach_success = (
+                self.movep_precise(
+                    approach,
+                    speed=speed,
+                    joint_tolerance=(
+                        joint_tolerance
+                    ),
+                    cartesian_tolerance=(
+                        cartesian_tolerance
+                    ),
+                    label=(
+                        'routing_probe_approach'
+                    ),
+                    primitive=primitive,
+                    record_event=False,
+                )
+            )
+        else:
+            approach_success = self.movep(
+                approach,
+                speed=speed,
+            )
+
+        success &= bool(
+            approach_success
+        )
+        if not approach_success:
+            record_probe_acquisition(
+                success=False,
+                failure_reason=(
+                    'approach_motion_failed'
+                ),
+                approach_success=False,
+                contact_detected=False,
+                grasp_active=False,
+                constraint_available=False,
+                lower_step_count=0,
+            )
+            return False
 
         lower = approach.copy()
-        floor_limit = max(0.0, float(pick[2]) - 0.01)
-        while not self.ee.detect_contact(deformable_ids) and lower[2] > floor_limit:
-            lower[2] += delta_z
-            success &= self.movep(
-                lower, speed=speed, joint_tolerance=joint_tolerance
+        floor_limit = max(
+            0.0,
+            float(pick[2]) - 0.01,
+        )
+        lower_step_count = 0
+
+        while (
+                not self.ee.detect_contact(
+                    deformable_ids
+                )
+                and lower[2] > floor_limit):
+            lower[2] = max(
+                floor_limit,
+                float(lower[2] + delta_z),
             )
-            if not success:
+
+            if precise_acquisition:
+                lower_success = (
+                    self.movep_precise(
+                        lower,
+                        speed=speed,
+                        joint_tolerance=(
+                            joint_tolerance
+                        ),
+                        cartesian_tolerance=(
+                            cartesian_tolerance
+                        ),
+                        label=(
+                            'routing_probe_lower_step'
+                        ),
+                        primitive=primitive,
+                        record_event=False,
+                    )
+                )
+            else:
+                lower_success = self.movep(
+                    lower,
+                    speed=speed,
+                    joint_tolerance=(
+                        joint_tolerance
+                    ),
+                )
+
+            lower_step_count += 1
+            success &= bool(
+                lower_success
+            )
+            if not lower_success:
+                record_probe_acquisition(
+                    success=False,
+                    failure_reason=(
+                        'contact_lowering_failed'
+                    ),
+                    approach_success=True,
+                    contact_detected=False,
+                    grasp_active=False,
+                    constraint_available=False,
+                    lower_step_count=(
+                        lower_step_count
+                    ),
+                )
                 return False
 
-        self.ee.activate(self.objects, deformable_ids)
-        if not self.ee.check_grasp():
+        contact_detected = bool(
+            self.ee.detect_contact(
+                deformable_ids
+            )
+        )
+
+        self.ee.activate(
+            self.objects,
+            deformable_ids,
+        )
+        grasp_active = bool(
+            self.ee.check_grasp()
+        )
+        constraint_available = bool(
+            getattr(
+                self.ee,
+                'contact_constraint',
+                None,
+            )
+            is not None
+        )
+
+        if not grasp_active:
+            failure_reason = (
+                'grasp_failed'
+                if contact_detected
+                else 'contact_not_detected'
+            )
+            record_probe_acquisition(
+                success=False,
+                failure_reason=(
+                    failure_reason
+                ),
+                approach_success=True,
+                contact_detected=(
+                    contact_detected
+                ),
+                grasp_active=False,
+                constraint_available=(
+                    constraint_available
+                ),
+                lower_step_count=(
+                    lower_step_count
+                ),
+            )
             self.ee.release()
             return False
+
+        record_probe_acquisition(
+            success=True,
+            failure_reason=None,
+            approach_success=True,
+            contact_detected=(
+                contact_detected
+            ),
+            grasp_active=True,
+            constraint_available=(
+                constraint_available
+            ),
+            lower_step_count=(
+                lower_step_count
+            ),
+        )
 
         grasp_tip = np.asarray(
             p.getLinkState(
@@ -1548,9 +1957,6 @@ class Environment():
         if self._ccda_motion_events[-1]['achieved_fraction'] < min_achieved_fraction:
             success = False
 
-        counter = getattr(self.task, 'physics_step_count', None)
-        if not callable(counter):
-            raise RuntimeError('latch probe task has no physics step counter')
         hold_start = int(counter())
         if hold_steps:
             self.step_physics(int(hold_steps))
