@@ -29,9 +29,13 @@ class FakeEE:
     def __init__(
         self,
         grasp_success=True,
+        target_contact_success=True,
     ):
         self.grasp_success = bool(
             grasp_success
+        )
+        self.target_contact_success = bool(
+            target_contact_success
         )
         self.contact_constraint = None
         self.detect_calls = 0
@@ -50,7 +54,7 @@ class FakeEE:
             target_object_id
         )
         self.detect_calls += 1
-        return self.detect_calls >= 2
+        return self.target_contact_success
 
     def activate(
         self,
@@ -81,12 +85,16 @@ class FakeEE:
 def make_env(
     monkeypatch,
     grasp_success=True,
+    target_contact_success=True,
 ):
     env = object.__new__(Environment)
     env.deterministic = True
     env.task = FakeTask()
     env.ee = FakeEE(
-        grasp_success=grasp_success
+        grasp_success=grasp_success,
+        target_contact_success=(
+            target_contact_success
+        ),
     )
     env.objects = []
     env._ccda_motion_events = []
@@ -211,6 +219,9 @@ def test_precise_acquisition_reaches_formal_motion(
                 "precise_endpoint_recovery"
             ),
             target_bead_index=0,
+            acquisition_descent_mode=(
+                "single_pass_target"
+            ),
         )
     )
 
@@ -262,6 +273,15 @@ def test_precise_acquisition_reaches_formal_motion(
     assert acquisition[
         "target_constraint_created"
     ]
+    assert acquisition[
+        "acquisition_descent_mode"
+    ] == "single_pass_target"
+    assert acquisition[
+        "descent_command_count"
+    ] == 1
+    assert acquisition[
+        "lower_step_count"
+    ] == 1
     assert env.ee.target_object_id == 40
 
 
@@ -283,6 +303,9 @@ def test_grasp_failure_is_recorded_before_lift(
                 "precise_endpoint_recovery"
             ),
             target_bead_index=0,
+            acquisition_descent_mode=(
+                "single_pass_target"
+            ),
         )
     )
 
@@ -336,6 +359,9 @@ def test_lower_steps_do_not_create_event_rows(
             "precise_endpoint_recovery"
         ),
         target_bead_index=0,
+        acquisition_descent_mode=(
+            "single_pass_target"
+        ),
     )
 
     assert all(
@@ -344,3 +370,47 @@ def test_lower_steps_do_not_create_event_rows(
         for event
         in env._ccda_motion_events
     )
+
+
+def test_target_contact_failure_is_explicit(
+    monkeypatch,
+):
+    env = make_env(
+        monkeypatch,
+        grasp_success=True,
+        target_contact_success=False,
+    )
+    pose0, stage1, final = poses()
+
+    success = (
+        env.pick_precise_tension_extension(
+            pose0,
+            stage1,
+            final,
+            acquisition_motion_mode=(
+                "precise_endpoint_recovery"
+            ),
+            target_bead_index=0,
+            acquisition_descent_mode=(
+                "single_pass_target"
+            ),
+        )
+    )
+
+    assert not success
+    acquisition = next(
+        event
+        for event
+        in env._ccda_motion_events
+        if event["stage"]
+        == "tension_pull_acquisition"
+    )
+    assert acquisition[
+        "failure_reason"
+    ] == "contact_not_detected"
+    assert acquisition[
+        "descent_command_count"
+    ] == 2
+    assert acquisition[
+        "lower_step_count"
+    ] == 2

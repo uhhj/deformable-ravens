@@ -15,6 +15,14 @@ from ravens.gripper import Gripper, Suction
 from ravens import tasks, utils
 
 
+LEGACY_STEPWISE_DESCENT = (
+    'legacy_stepwise'
+)
+SINGLE_PASS_TARGET_DESCENT = (
+    'single_pass_target'
+)
+
+
 class Environment():
 
     def __init__(
@@ -298,6 +306,82 @@ class Environment():
         )
         return int(info[2]) == int(
             target_body_id
+        )
+
+    def _ccda_precise_target_descent(
+            self,
+            *,
+            approach,
+            pick_z,
+            floor_limit,
+            target_body_id,
+            speed,
+            joint_tolerance,
+            cartesian_tolerance,
+            primitive,
+            label_prefix):
+        approach = np.asarray(
+            approach,
+            dtype=np.float64,
+        )
+        target_body_id = int(
+            target_body_id
+        )
+        pick_z = float(pick_z)
+        floor_limit = float(
+            floor_limit
+        )
+
+        target_z_values = [pick_z]
+        if floor_limit < pick_z:
+            target_z_values.append(
+                floor_limit
+            )
+
+        command_count = 0
+        for target_z in target_z_values:
+            target = approach.copy()
+            target[2] = target_z
+            command_count += 1
+
+            motion_success = (
+                self.movep_precise(
+                    target,
+                    speed=speed,
+                    joint_tolerance=(
+                        joint_tolerance
+                    ),
+                    cartesian_tolerance=(
+                        cartesian_tolerance
+                    ),
+                    label=(
+                        f'{label_prefix}_'
+                        'contact_target'
+                    ),
+                    primitive=primitive,
+                    record_event=False,
+                )
+            )
+            if not motion_success:
+                return (
+                    False,
+                    False,
+                    command_count,
+                )
+
+            if self.ee.detect_target_contact(
+                target_body_id
+            ):
+                return (
+                    True,
+                    True,
+                    command_count,
+                )
+
+        return (
+            True,
+            False,
+            command_count,
         )
 
     def reset_ccda_motion_events(self):
@@ -1667,7 +1751,10 @@ class Environment():
             acquisition_motion_mode=(
                 'legacy_joint_return'
             ),
-            target_bead_index=None):
+            target_bead_index=None,
+            acquisition_descent_mode=(
+                LEGACY_STEPWISE_DESCENT
+            )):
         acquisition_motion_mode = str(
             acquisition_motion_mode
         )
@@ -1682,6 +1769,18 @@ class Environment():
             acquisition_motion_mode
             == 'precise_endpoint_recovery'
         )
+        acquisition_descent_mode = str(
+            acquisition_descent_mode
+        )
+        if acquisition_descent_mode not in {
+            LEGACY_STEPWISE_DESCENT,
+            SINGLE_PASS_TARGET_DESCENT,
+        }:
+            raise ValueError(
+                'unsupported '
+                'acquisition_descent_mode '
+                f'{acquisition_descent_mode!r}'
+            )
         if not self.deterministic:
             raise RuntimeError('pick_precise_latch_probe requires fixed-step mode')
         if lift_height <= 0:
@@ -1751,7 +1850,8 @@ class Environment():
                 grasp_active,
                 constraint_available,
                 target_constraint_created,
-                lower_step_count):
+                lower_step_count,
+                descent_command_count):
             physics_step_end = int(
                 counter()
             )
@@ -1796,6 +1896,12 @@ class Environment():
                 ),
                 'target_constraint_created': bool(
                     target_constraint_created
+                ),
+                'acquisition_descent_mode': (
+                    acquisition_descent_mode
+                ),
+                'descent_command_count': int(
+                    descent_command_count
                 ),
                 'lower_step_count': int(
                     lower_step_count
@@ -1880,6 +1986,7 @@ class Environment():
                 constraint_available=False,
                 target_constraint_created=False,
                 lower_step_count=0,
+                descent_command_count=0,
             )
             return False
 
@@ -1890,42 +1997,39 @@ class Environment():
         )
         lower_step_count = 0
 
-        while (
-                not contact_now()
-                and lower[2] > floor_limit):
-            lower[2] = max(
-                floor_limit,
-                float(lower[2] + delta_z),
+        if (
+                precise_acquisition
+                and acquisition_descent_mode
+                == SINGLE_PASS_TARGET_DESCENT):
+            if target_body_id is None:
+                raise ValueError(
+                    'single_pass_target requires '
+                    'target_bead_index'
+                )
+
+            (
+                lower_success,
+                contact_detected,
+                lower_step_count,
+            ) = self._ccda_precise_target_descent(
+                approach=approach,
+                pick_z=float(pick[2]),
+                floor_limit=floor_limit,
+                target_body_id=(
+                    target_body_id
+                ),
+                speed=speed,
+                joint_tolerance=(
+                    joint_tolerance
+                ),
+                cartesian_tolerance=(
+                    cartesian_tolerance
+                ),
+                primitive=primitive,
+                label_prefix=(
+                    'routing_probe'
+                ),
             )
-
-            if precise_acquisition:
-                lower_success = (
-                    self.movep_precise(
-                        lower,
-                        speed=speed,
-                        joint_tolerance=(
-                            joint_tolerance
-                        ),
-                        cartesian_tolerance=(
-                            cartesian_tolerance
-                        ),
-                        label=(
-                            'routing_probe_lower_step'
-                        ),
-                        primitive=primitive,
-                        record_event=False,
-                    )
-                )
-            else:
-                lower_success = self.movep(
-                    lower,
-                    speed=speed,
-                    joint_tolerance=(
-                        joint_tolerance
-                    ),
-                )
-
-            lower_step_count += 1
             success &= bool(
                 lower_success
             )
@@ -1943,10 +2047,74 @@ class Environment():
                     lower_step_count=(
                         lower_step_count
                     ),
+                    descent_command_count=(
+                        lower_step_count
+                    ),
                 )
                 return False
+        else:
+            while (
+                    not contact_now()
+                    and lower[2] > floor_limit):
+                lower[2] = max(
+                    floor_limit,
+                    float(lower[2] + delta_z),
+                )
 
-        contact_detected = contact_now()
+                if precise_acquisition:
+                    lower_success = (
+                        self.movep_precise(
+                            lower,
+                            speed=speed,
+                            joint_tolerance=(
+                                joint_tolerance
+                            ),
+                            cartesian_tolerance=(
+                                cartesian_tolerance
+                            ),
+                            label=(
+                                'routing_probe_lower_step'
+                            ),
+                            primitive=primitive,
+                            record_event=False,
+                        )
+                    )
+                else:
+                    lower_success = self.movep(
+                        lower,
+                        speed=speed,
+                        joint_tolerance=(
+                            joint_tolerance
+                        ),
+                    )
+
+                lower_step_count += 1
+                success &= bool(
+                    lower_success
+                )
+                if not lower_success:
+                    record_probe_acquisition(
+                        success=False,
+                        failure_reason=(
+                            'contact_lowering_failed'
+                        ),
+                        approach_success=True,
+                        contact_detected=False,
+                        grasp_active=False,
+                        constraint_available=False,
+                        target_constraint_created=False,
+                        lower_step_count=(
+                            lower_step_count
+                        ),
+                        descent_command_count=(
+                            lower_step_count
+                        ),
+                    )
+                    return False
+
+            contact_detected = (
+                contact_now()
+            )
 
         if (
             target_body_id is not None
@@ -1963,6 +2131,9 @@ class Environment():
                 constraint_available=False,
                 target_constraint_created=False,
                 lower_step_count=(
+                    lower_step_count
+                ),
+                descent_command_count=(
                     lower_step_count
                 ),
             )
@@ -2037,6 +2208,9 @@ class Environment():
                 lower_step_count=(
                     lower_step_count
                 ),
+                descent_command_count=(
+                    lower_step_count
+                ),
             )
             self.ee.release()
             return False
@@ -2056,6 +2230,9 @@ class Environment():
                 target_constraint_created
             ),
             lower_step_count=(
+                lower_step_count
+            ),
+            descent_command_count=(
                 lower_step_count
             ),
         )
@@ -2142,7 +2319,10 @@ class Environment():
             acquisition_motion_mode=(
                 'legacy_joint_return'
             ),
-            target_bead_index=None):
+            target_bead_index=None,
+            acquisition_descent_mode=(
+                LEGACY_STEPWISE_DESCENT
+            )):
         """One grasp, two collinear waypoints, then release."""
         if not self.deterministic:
             raise RuntimeError(
@@ -2169,6 +2349,18 @@ class Environment():
             acquisition_motion_mode
             == 'precise_endpoint_recovery'
         )
+        acquisition_descent_mode = str(
+            acquisition_descent_mode
+        )
+        if acquisition_descent_mode not in {
+            LEGACY_STEPWISE_DESCENT,
+            SINGLE_PASS_TARGET_DESCENT,
+        }:
+            raise ValueError(
+                'unsupported '
+                'acquisition_descent_mode '
+                f'{acquisition_descent_mode!r}'
+            )
         if lift_height <= 0:
             raise ValueError('lift_height must be positive')
         if approach_height <= lift_height:
@@ -2240,7 +2432,8 @@ class Environment():
                 grasp_active,
                 constraint_available,
                 target_constraint_created,
-                lower_step_count):
+                lower_step_count,
+                descent_command_count):
             physics_step_end = int(
                 counter()
             )
@@ -2279,6 +2472,12 @@ class Environment():
                 ),
                 'target_constraint_created': bool(
                     target_constraint_created
+                ),
+                'acquisition_descent_mode': (
+                    acquisition_descent_mode
+                ),
+                'descent_command_count': int(
+                    descent_command_count
                 ),
                 'lower_step_count': int(
                     lower_step_count
@@ -2378,6 +2577,7 @@ class Environment():
                 constraint_available=False,
                 target_constraint_created=False,
                 lower_step_count=0,
+                descent_command_count=0,
             )
             return False
 
@@ -2388,41 +2588,39 @@ class Environment():
         )
         lower_step_count = 0
 
-        while (
-                not contact_now()
-                and lower[2] > floor_limit):
-            lower[2] = max(
-                floor_limit,
-                float(lower[2] + delta_z),
-            )
-            if precise_acquisition:
-                lower_success = (
-                    self.movep_precise(
-                        lower,
-                        speed=speed,
-                        joint_tolerance=(
-                            joint_tolerance
-                        ),
-                        cartesian_tolerance=(
-                            cartesian_tolerance
-                        ),
-                        label=(
-                            'tension_pull_lower_step'
-                        ),
-                        primitive=primitive,
-                        record_event=False,
-                    )
-                )
-            else:
-                lower_success = self.movep(
-                    lower,
-                    speed=speed,
-                    joint_tolerance=(
-                        joint_tolerance
-                    ),
+        if (
+                precise_acquisition
+                and acquisition_descent_mode
+                == SINGLE_PASS_TARGET_DESCENT):
+            if target_body_id is None:
+                raise ValueError(
+                    'single_pass_target requires '
+                    'target_bead_index'
                 )
 
-            lower_step_count += 1
+            (
+                lower_success,
+                contact_detected,
+                lower_step_count,
+            ) = self._ccda_precise_target_descent(
+                approach=approach,
+                pick_z=float(pick[2]),
+                floor_limit=floor_limit,
+                target_body_id=(
+                    target_body_id
+                ),
+                speed=speed,
+                joint_tolerance=(
+                    joint_tolerance
+                ),
+                cartesian_tolerance=(
+                    cartesian_tolerance
+                ),
+                primitive=primitive,
+                label_prefix=(
+                    'tension_pull'
+                ),
+            )
             success &= bool(lower_success)
             if not lower_success:
                 record_acquisition(
@@ -2438,10 +2636,69 @@ class Environment():
                     lower_step_count=(
                         lower_step_count
                     ),
+                    descent_command_count=(
+                        lower_step_count
+                    ),
                 )
                 return False
+        else:
+            while (
+                    not contact_now()
+                    and lower[2] > floor_limit):
+                lower[2] = max(
+                    floor_limit,
+                    float(lower[2] + delta_z),
+                )
+                if precise_acquisition:
+                    lower_success = (
+                        self.movep_precise(
+                            lower,
+                            speed=speed,
+                            joint_tolerance=(
+                                joint_tolerance
+                            ),
+                            cartesian_tolerance=(
+                                cartesian_tolerance
+                            ),
+                            label=(
+                                'tension_pull_lower_step'
+                            ),
+                            primitive=primitive,
+                            record_event=False,
+                        )
+                    )
+                else:
+                    lower_success = self.movep(
+                        lower,
+                        speed=speed,
+                        joint_tolerance=(
+                            joint_tolerance
+                        ),
+                    )
 
-        contact_detected = contact_now()
+                lower_step_count += 1
+                success &= bool(lower_success)
+                if not lower_success:
+                    record_acquisition(
+                        success=False,
+                        failure_reason=(
+                            'contact_lowering_failed'
+                        ),
+                        approach_success=True,
+                        contact_detected=False,
+                        grasp_active=False,
+                        constraint_available=False,
+                        target_constraint_created=False,
+                        lower_step_count=(
+                            lower_step_count
+                        ),
+                        descent_command_count=(
+                            lower_step_count
+                        ),
+                    )
+                    return False
+
+            contact_detected = contact_now()
         if not contact_detected:
             record_acquisition(
                 success=False,
@@ -2454,6 +2711,9 @@ class Environment():
                 constraint_available=False,
                 target_constraint_created=False,
                 lower_step_count=(
+                    lower_step_count
+                ),
+                descent_command_count=(
                     lower_step_count
                 ),
             )
@@ -2526,6 +2786,9 @@ class Environment():
                 lower_step_count=(
                     lower_step_count
                 ),
+                descent_command_count=(
+                    lower_step_count
+                ),
             )
             self.ee.release()
             retreat = approach.copy()
@@ -2546,6 +2809,9 @@ class Environment():
                 target_constraint_created
             ),
             lower_step_count=(
+                lower_step_count
+            ),
+            descent_command_count=(
                 lower_step_count
             ),
         )

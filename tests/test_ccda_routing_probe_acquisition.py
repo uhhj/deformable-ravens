@@ -31,9 +31,13 @@ class FakeEE:
     def __init__(
         self,
         grasp_success=True,
+        target_contact_success=True,
     ):
         self.grasp_success = bool(
             grasp_success
+        )
+        self.target_contact_success = bool(
+            target_contact_success
         )
         self.contact_constraint = None
         self.detect_calls = 0
@@ -52,7 +56,7 @@ class FakeEE:
             target_object_id
         )
         self.detect_calls += 1
-        return self.detect_calls >= 2
+        return self.target_contact_success
 
     def activate(
         self,
@@ -85,6 +89,7 @@ class FakeEE:
 def make_env(
     monkeypatch,
     grasp_success=True,
+    target_contact_success=True,
 ):
     env = object.__new__(
         Environment
@@ -92,7 +97,10 @@ def make_env(
     env.deterministic = True
     env.task = FakeTask()
     env.ee = FakeEE(
-        grasp_success=grasp_success
+        grasp_success=grasp_success,
+        target_contact_success=(
+            target_contact_success
+        ),
     )
     env.objects = []
     env._ccda_motion_events = []
@@ -204,6 +212,9 @@ def test_precise_probe_acquisition_reaches_formal_events(
                 "precise_endpoint_recovery"
             ),
             target_bead_index=1,
+            acquisition_descent_mode=(
+                "single_pass_target"
+            ),
         )
     )
 
@@ -273,6 +284,15 @@ def test_precise_probe_acquisition_reaches_formal_events(
     assert acquisition[
         "target_constraint_created"
     ]
+    assert acquisition[
+        "acquisition_descent_mode"
+    ] == "single_pass_target"
+    assert acquisition[
+        "descent_command_count"
+    ] == 1
+    assert acquisition[
+        "lower_step_count"
+    ] == 1
     assert env.ee.target_object_id == 41
 
 
@@ -291,6 +311,9 @@ def test_probe_grasp_failure_is_explicit(
                 "precise_endpoint_recovery"
             ),
             target_bead_index=1,
+            acquisition_descent_mode=(
+                "single_pass_target"
+            ),
         )
     )
 
@@ -347,6 +370,9 @@ def test_wrong_target_constraint_is_rejected(
                 "precise_endpoint_recovery"
             ),
             target_bead_index=1,
+            acquisition_descent_mode=(
+                "single_pass_target"
+            ),
         )
     )
 
@@ -363,6 +389,43 @@ def test_wrong_target_constraint_is_rejected(
     assert not acquisition[
         "target_constraint_created"
     ]
+
+
+def test_target_contact_failure_is_explicit(
+    monkeypatch,
+):
+    env = make_env(
+        monkeypatch,
+        grasp_success=True,
+        target_contact_success=False,
+    )
+
+    success = (
+        env.pick_precise_latch_probe(
+            pose0(),
+            acquisition_motion_mode=(
+                "precise_endpoint_recovery"
+            ),
+            target_bead_index=1,
+            acquisition_descent_mode=(
+                "single_pass_target"
+            ),
+        )
+    )
+
+    assert not success
+    acquisition = (
+        env._ccda_motion_events[0]
+    )
+    assert acquisition[
+        "failure_reason"
+    ] == "contact_not_detected"
+    assert acquisition[
+        "descent_command_count"
+    ] == 2
+    assert acquisition[
+        "lower_step_count"
+    ] == 2
 
 
 def test_legacy_probe_mode_has_no_new_event(
