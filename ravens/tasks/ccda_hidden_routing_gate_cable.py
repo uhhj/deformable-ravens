@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 
 import numpy as np
@@ -16,6 +17,20 @@ from ravens.tasks.ccda_hidden_routing_gate_geometry import (
     HiddenRoutingGateGeometryConfig,
     compute_hidden_routing_gate_layout,
     public_routing_layout,
+)
+
+
+RECOMPUTE_ACTION_STATE_LAYOUT_MODE = (
+    "recompute_from_action_state"
+)
+FROZEN_BRANCH_ARM_LAYOUT_MODE = (
+    "frozen_at_branch_arm"
+)
+FROZEN_PUBLIC_LAYOUT_ENV = (
+    "CCDA_ROUTING_FROZEN_PUBLIC_LAYOUT_JSON"
+)
+PUBLIC_LAYOUT_MODE_ENV = (
+    "CCDA_ROUTING_PUBLIC_LAYOUT_MODE"
 )
 
 
@@ -43,6 +58,7 @@ class CCDAHiddenRoutingGateCable(
             None
         )
         self._selected_probe_index = None
+        self._frozen_public_routing_layout = None
 
     def _routing_config(self):
         return HiddenRoutingGateGeometryConfig(
@@ -221,6 +237,24 @@ class CCDAHiddenRoutingGateCable(
         ))
         return layout
 
+    def _public_layout_mode(self):
+        return os.environ.get(
+            PUBLIC_LAYOUT_MODE_ENV,
+            RECOMPUTE_ACTION_STATE_LAYOUT_MODE,
+        )
+
+    def _current_public_routing_layout(self):
+        if (
+            self._frozen_public_routing_layout
+            is not None
+        ):
+            return copy.deepcopy(
+                self._frozen_public_routing_layout
+            )
+        return public_routing_layout(
+            self._hook_layout
+        )
+
     def arm_ccda_hidden_factor_after_settle(
         self,
     ):
@@ -256,14 +290,84 @@ class CCDAHiddenRoutingGateCable(
             super()
             .arm_ccda_hidden_factor_after_settle()
         )
+
+        mode = self._public_layout_mode()
+        if (
+            mode
+            == FROZEN_BRANCH_ARM_LAYOUT_MODE
+        ):
+            self._freeze_public_routing_layout()
+
         result["selected_probe_index"] = (
             self._selected_probe_index
         )
+        result["public_layout_mode"] = mode
         return result
 
-    def _create_visible_target_zone(self):
+    def reset_ccda_branch(
+        self,
+        condition,
+    ):
+        super().reset_ccda_branch(
+            condition
+        )
+        self._frozen_public_routing_layout = (
+            None
+        )
+        os.environ.pop(
+            FROZEN_PUBLIC_LAYOUT_ENV,
+            None,
+        )
+
+    def _position_visible_target_zone(
+        self,
+        public,
+    ):
+        if self._target_zone_body_id is None:
+            return
+
+        center_xy = np.asarray(
+            public["target_zone_center_xy"],
+            dtype=np.float64,
+        )
+        yaw = float(
+            public["target_zone_yaw"]
+        )
+        p.resetBasePositionAndOrientation(
+            int(self._target_zone_body_id),
+            (
+                float(center_xy[0]),
+                float(center_xy[1]),
+                0.001,
+            ),
+            p.getQuaternionFromEuler(
+                (0, 0, yaw)
+            ),
+        )
+
+    def _freeze_public_routing_layout(
+        self,
+    ):
         public = public_routing_layout(
             self._hook_layout
+        )
+        self._frozen_public_routing_layout = (
+            copy.deepcopy(public)
+        )
+        os.environ[
+            FROZEN_PUBLIC_LAYOUT_ENV
+        ] = json.dumps(
+            public,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._position_visible_target_zone(
+            public
+        )
+
+    def _create_visible_target_zone(self):
+        public = (
+            self._current_public_routing_layout()
         )
         center_xy = np.asarray(
             public["target_zone_center_xy"],
@@ -326,8 +430,15 @@ class CCDAHiddenRoutingGateCable(
             None
         )
         self._selected_probe_index = None
+        self._frozen_public_routing_layout = (
+            None
+        )
         os.environ.pop(
             "CCDA_ROUTING_SELECTED_PROBE_INDEX",
+            None,
+        )
+        os.environ.pop(
+            FROZEN_PUBLIC_LAYOUT_ENV,
             None,
         )
         super().reset(
@@ -355,10 +466,8 @@ class CCDAHiddenRoutingGateCable(
             "task_family": (
                 "hidden_routing_gate"
             ),
-            "public_task": copy.deepcopy(
-                public_routing_layout(
-                    self._hook_layout
-                )
+            "public_task": (
+                self._current_public_routing_layout()
             ),
             "target_zone_body_id": (
                 self._target_zone_body_id
@@ -369,6 +478,13 @@ class CCDAHiddenRoutingGateCable(
     def ccda_privileged_state(self):
         state = super().ccda_privileged_state()
         layout = state.pop("hook_layout")
+        if "public_task" not in self._hook_layout:
+            self._hook_layout = copy.deepcopy(
+                layout
+            )
+        public = (
+            self._current_public_routing_layout()
+        )
         result = {
             **state,
             "environment_version": (
@@ -380,8 +496,13 @@ class CCDAHiddenRoutingGateCable(
             "topology": str(
                 layout["topology"]
             ),
-            "public_task": copy.deepcopy(
-                public_routing_layout(layout)
+            "public_task": public,
+            "public_layout_mode": (
+                self._public_layout_mode()
+            ),
+            "public_layout_frozen": bool(
+                self._frozen_public_routing_layout
+                is not None
             ),
             "routing_gate_layout_privileged": (
                 layout
