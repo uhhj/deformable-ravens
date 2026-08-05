@@ -28,6 +28,8 @@ from ravens.tasks.ccda_slack_cable_v2 import CCDASlackCableV2
 from ravens.tasks.ccda_hidden_friction_cable import CCDAHiddenFrictionCable
 from ravens.tasks.ccda_hidden_hook_cable import CCDAHiddenHookCable
 from ravens.tasks.ccda_hidden_latch_cable import CCDAHiddenLatchCable
+from ravens.tasks.ccda_hidden_routing_gate_cable import (
+        CCDAHiddenRoutingGateCable)
 from ravens.tasks.defs_bags import (
         BagAloneOpen, BagItemsEasy, BagItemsHard, BagColorGoal)
 
@@ -51,6 +53,7 @@ names = {'sorting':             Sorting,
          'ccda-hidden-friction-cable': CCDAHiddenFrictionCable,
          'ccda-hidden-hook-cable': CCDAHiddenHookCable,
          'ccda-hidden-latch-cable': CCDAHiddenLatchCable,
+         'ccda-hidden-routing-gate-cable': CCDAHiddenRoutingGateCable,
          'cable-ring':          CableRing,
          'cable-ring-notarget': CableRingNoTarget,
          'cloth-flat':          ClothFlat,
