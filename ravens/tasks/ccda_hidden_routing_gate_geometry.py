@@ -8,6 +8,19 @@ from typing import Any, Dict, List, Sequence
 import numpy as np
 
 
+WHOLE_CABLE_BARRIER_MODE = (
+    "whole_cable_span"
+)
+ENDPOINT_CORRIDOR_BARRIER_MODE = (
+    "endpoint_corridor"
+)
+BARRIER_MODES = (
+    WHOLE_CABLE_BARRIER_MODE,
+    ENDPOINT_CORRIDOR_BARRIER_MODE,
+)
+
+
+
 @dataclass(frozen=True)
 class HiddenRoutingGateGeometryConfig:
     center_ratio: float
@@ -27,15 +40,25 @@ class HiddenRoutingGateGeometryConfig:
     leading_segment_size: int
     workspace_x: Sequence[float]
     workspace_y: Sequence[float]
+    barrier_mode: str = (
+        WHOLE_CABLE_BARRIER_MODE
+    )
+    barrier_safety_margin: float = 0.0
     bead_radius: float = 0.005
-    topology_id: str = "hidden_routing_gate_v1"
+    topology_id: str = (
+        "hidden_routing_gate_v1"
+    )
 
     def __post_init__(self):
         if not str(self.topology_id).strip():
             raise ValueError(
                 "topology_id must be non-empty"
             )
-        if not 0.0 <= float(self.center_ratio) <= 1.0:
+        if not (
+            0.0
+            <= float(self.center_ratio)
+            <= 1.0
+        ):
             raise ValueError(
                 "center_ratio must lie in [0,1]"
             )
@@ -47,7 +70,6 @@ class HiddenRoutingGateGeometryConfig:
             "probe_roof_thickness",
             "barrier_offset",
             "barrier_thickness",
-            "barrier_width",
             "barrier_height",
             "stage1_pull_distance",
             "final_pull_distance",
@@ -57,48 +79,130 @@ class HiddenRoutingGateGeometryConfig:
             "bead_radius",
         )
         for name in positive:
-            value = float(getattr(self, name))
-            if not np.isfinite(value) or value <= 0:
+            value = float(
+                getattr(self, name)
+            )
+            if (
+                not np.isfinite(value)
+                or value <= 0
+            ):
                 raise ValueError(
-                    f"{name} must be finite and positive"
+                    f"{name} must be finite "
+                    "and positive"
                 )
 
-        if int(self.leading_segment_size) <= 0:
+        mode = str(
+            self.barrier_mode
+        ).strip()
+        if mode not in BARRIER_MODES:
             raise ValueError(
-                "leading_segment_size must be positive"
+                "unsupported barrier_mode "
+                f"{mode!r}"
+            )
+
+        width = float(
+            self.barrier_width
+        )
+        safety = float(
+            self.barrier_safety_margin
+        )
+        if not np.isfinite(width):
+            raise ValueError(
+                "barrier_width must be finite"
+            )
+        if not np.isfinite(safety):
+            raise ValueError(
+                "barrier_safety_margin "
+                "must be finite"
+            )
+
+        if (
+            mode
+            == WHOLE_CABLE_BARRIER_MODE
+        ):
+            if width <= 0:
+                raise ValueError(
+                    "whole-cable barrier_width "
+                    "must be positive"
+                )
+            if abs(safety) > 1e-12:
+                raise ValueError(
+                    "whole-cable mode must not "
+                    "use barrier_safety_margin"
+                )
+        else:
+            if abs(width) > 1e-12:
+                raise ValueError(
+                    "endpoint-corridor mode "
+                    "derives width and requires "
+                    "barrier_width=0"
+                )
+            if safety <= 0:
+                raise ValueError(
+                    "endpoint-corridor mode "
+                    "requires a positive fixed "
+                    "barrier_safety_margin"
+                )
+
+        if int(
+            self.leading_segment_size
+        ) <= 0:
+            raise ValueError(
+                "leading_segment_size "
+                "must be positive"
             )
         if (
-            float(self.final_pull_distance)
-            <= float(self.stage1_pull_distance)
+            float(
+                self.final_pull_distance
+            )
+            <= float(
+                self.stage1_pull_distance
+            )
         ):
             raise ValueError(
-                "final pull must exceed stage-1 pull"
+                "final pull must exceed "
+                "stage-1 pull"
             )
 
         barrier_far_face = (
             float(self.barrier_offset)
-            + float(self.barrier_thickness) / 2
+            + float(
+                self.barrier_thickness
+            ) / 2
         )
         if (
-            float(self.target_plane_offset)
+            float(
+                self.target_plane_offset
+            )
             <= barrier_far_face
             + float(self.bead_radius)
         ):
             raise ValueError(
-                "target plane must lie beyond the "
-                "barrier and one bead radius"
+                "target plane must lie beyond "
+                "the barrier and one bead radius"
             )
         if (
-            float(self.final_pull_distance)
-            <= float(self.target_plane_offset)
+            float(
+                self.final_pull_distance
+            )
+            <= float(
+                self.target_plane_offset
+            )
         ):
             raise ValueError(
-                "final target must lie beyond target plane"
+                "final target must lie beyond "
+                "target plane"
             )
 
         for name, bounds in (
-            ("workspace_x", self.workspace_x),
-            ("workspace_y", self.workspace_y),
+            (
+                "workspace_x",
+                self.workspace_x,
+            ),
+            (
+                "workspace_y",
+                self.workspace_y,
+            ),
         ):
             values = np.asarray(
                 bounds,
@@ -106,10 +210,56 @@ class HiddenRoutingGateGeometryConfig:
             ).reshape(-1)
             if (
                 values.size != 2
-                or not np.all(np.isfinite(values))
+                or not np.all(
+                    np.isfinite(values)
+                )
                 or values[0] >= values[1]
             ):
-                raise ValueError(f"invalid {name}")
+                raise ValueError(
+                    f"invalid {name}"
+                )
+
+    @property
+    def bead_collision_support(
+        self,
+    ) -> float:
+        return float(
+            np.sqrt(3.0)
+            * float(self.bead_radius)
+        )
+
+    @property
+    def corridor_required_width(
+        self,
+    ) -> float:
+        return float(
+            2.0 * (
+                float(
+                    self
+                    .target_corridor_half_width
+                )
+                + self.bead_collision_support
+            )
+        )
+
+    @property
+    def resolved_barrier_width(
+        self,
+    ) -> float:
+        if (
+            str(self.barrier_mode)
+            == WHOLE_CABLE_BARRIER_MODE
+        ):
+            return float(
+                self.barrier_width
+            )
+        return float(
+            self.corridor_required_width
+            + 2.0
+            * float(
+                self.barrier_safety_margin
+            )
+        )
 
 
 class HiddenRoutingGateGeometryError(RuntimeError):
@@ -289,6 +439,226 @@ def _json_float(value):
     return value
 
 
+def _barrier_candidate_geometry(
+    beads,
+    endpoint,
+    tangent,
+    normal,
+    centroid,
+    bounding_radius,
+    config,
+):
+    mode = str(
+        config.barrier_mode
+    )
+    resolved_width = float(
+        config.resolved_barrier_width
+    )
+
+    tangent_projection = (
+        beads[:, :2] @ tangent
+    )
+    tangent_min = float(
+        np.min(tangent_projection)
+    )
+    tangent_max = float(
+        np.max(tangent_projection)
+    )
+    tangent_midpoint = 0.5 * (
+        tangent_min + tangent_max
+    )
+
+    if (
+        mode
+        == WHOLE_CABLE_BARRIER_MODE
+    ):
+        endpoint_from_centroid = (
+            endpoint[:2] - centroid
+        )
+        barrier_center = (
+            centroid
+            + normal * (
+                float(np.dot(
+                    endpoint_from_centroid,
+                    normal,
+                ))
+                + config.barrier_offset
+            )
+        )
+        tangent_reference = (
+            tangent_midpoint
+        )
+        coverage_reference = (
+            "whole_cable_tangent_span"
+        )
+    elif (
+        mode
+        == ENDPOINT_CORRIDOR_BARRIER_MODE
+    ):
+        barrier_center = (
+            endpoint[:2]
+            + normal
+            * config.barrier_offset
+        )
+        tangent_reference = float(
+            np.dot(
+                endpoint[:2],
+                tangent,
+            )
+        )
+        coverage_reference = (
+            "pulled_endpoint_target_corridor"
+        )
+    else:
+        raise RuntimeError(
+            "validated barrier mode "
+            "became unsupported"
+        )
+
+    centered_tangent_coordinate = float(
+        np.dot(
+            barrier_center,
+            tangent,
+        )
+    )
+    tangent_center_error = float(
+        centered_tangent_coordinate
+        - tangent_reference
+    )
+    tangent_coordinates = (
+        beads[:, :2]
+        - barrier_center.reshape(1, 2)
+    ) @ tangent
+    max_abs_tangent_coordinate = float(
+        np.max(
+            np.abs(
+                tangent_coordinates
+            )
+        )
+    )
+    full_cable_required_width = float(
+        2.0 * (
+            max_abs_tangent_coordinate
+            + bounding_radius
+        )
+    )
+
+    if (
+        mode
+        == WHOLE_CABLE_BARRIER_MODE
+    ):
+        required_width = (
+            full_cable_required_width
+        )
+        coverage_margin = float(
+            resolved_width / 2
+            - max_abs_tangent_coordinate
+            - bounding_radius
+        )
+    else:
+        required_width = float(
+            config.corridor_required_width
+        )
+        coverage_margin = float(
+            resolved_width / 2
+            - float(
+                config
+                .target_corridor_half_width
+            )
+            - bounding_radius
+        )
+
+    yaw_tangent = float(
+        np.arctan2(
+            tangent[1],
+            tangent[0],
+        )
+    )
+    barrier = {
+        "name": "routing_barrier",
+        "center_xy": (
+            barrier_center
+            .astype(float)
+            .tolist()
+        ),
+        "center_z": float(
+            config.barrier_height / 2
+        ),
+        "half_extents": [
+            float(
+                resolved_width / 2
+            ),
+            float(
+                config
+                .barrier_thickness / 2
+            ),
+            float(
+                config.barrier_height / 2
+            ),
+        ],
+        "yaw": yaw_tangent,
+    }
+    return {
+        "barrier_mode": mode,
+        "coverage_reference": (
+            coverage_reference
+        ),
+        "barrier": barrier,
+        "barrier_center_xy": (
+            barrier_center
+            .astype(float)
+            .tolist()
+        ),
+        "barrier_center_tangent_coordinate": (
+            centered_tangent_coordinate
+        ),
+        "barrier_tangent_reference": (
+            tangent_reference
+        ),
+        "barrier_tangent_center_error": (
+            tangent_center_error
+        ),
+        "tangent_projection_min": (
+            tangent_min
+        ),
+        "tangent_projection_max": (
+            tangent_max
+        ),
+        "tangent_projection_midpoint": (
+            tangent_midpoint
+        ),
+        "max_abs_tangent_coordinate": (
+            max_abs_tangent_coordinate
+        ),
+        "configured_barrier_width": (
+            float(config.barrier_width)
+        ),
+        "resolved_barrier_width": (
+            resolved_width
+        ),
+        "required_barrier_width": (
+            required_width
+        ),
+        "full_cable_required_width_diagnostic": (
+            full_cable_required_width
+        ),
+        "barrier_width_shortfall": (
+            float(max(
+                0.0,
+                required_width
+                - resolved_width,
+            ))
+        ),
+        "coverage_margin": (
+            coverage_margin
+        ),
+        "barrier_safety_margin": (
+            float(
+                config
+                .barrier_safety_margin
+            )
+        ),
+    }
 def _candidate_rejection_reasons(row):
     reasons = []
     if row["coverage_margin"] <= 0:
@@ -382,107 +752,34 @@ def evaluate_hidden_routing_gate_candidates(
             if endpoint_index == 0
             else -endpoint_axis
         )
-        tangent_projection = (
-            beads[:, :2] @ tangent
-        )
-        tangent_min = float(
-            np.min(tangent_projection)
-        )
-        tangent_max = float(
-            np.max(tangent_projection)
-        )
-        tangent_midpoint = 0.5 * (
-            tangent_min + tangent_max
-        )
-
         for normal_sign in (-1.0, 1.0):
             normal = (
                 normal_sign * base_normal
             )
-            yaw_tangent = float(
-                np.arctan2(
-                    tangent[1],
-                    tangent[0],
+            barrier_geometry = (
+                _barrier_candidate_geometry(
+                    beads=beads,
+                    endpoint=endpoint,
+                    tangent=tangent,
+                    normal=normal,
+                    centroid=centroid,
+                    bounding_radius=(
+                        bounding_radius
+                    ),
+                    config=config,
                 )
+            )
+            barrier = (
+                barrier_geometry["barrier"]
+            )
+            yaw_tangent = float(
+                barrier["yaw"]
             )
             yaw_normal = float(
                 np.arctan2(
                     normal[1],
                     normal[0],
                 )
-            )
-
-            endpoint_from_centroid = (
-                endpoint[:2] - centroid
-            )
-            barrier_center = (
-                centroid
-                + normal * (
-                    float(np.dot(
-                        endpoint_from_centroid,
-                        normal,
-                    ))
-                    + config.barrier_offset
-                )
-            )
-            barrier = {
-                "name": "routing_barrier",
-                "center_xy": (
-                    barrier_center
-                    .astype(float)
-                    .tolist()
-                ),
-                "center_z": float(
-                    config.barrier_height / 2
-                ),
-                "half_extents": [
-                    float(
-                        config.barrier_width / 2
-                    ),
-                    float(
-                        config.barrier_thickness / 2
-                    ),
-                    float(
-                        config.barrier_height / 2
-                    ),
-                ],
-                "yaw": yaw_tangent,
-            }
-
-            centered_tangent_coordinate = float(
-                np.dot(
-                    barrier_center,
-                    tangent,
-                )
-            )
-            tangent_center_error = float(
-                centered_tangent_coordinate
-                - tangent_midpoint
-            )
-            tangent_coordinates = (
-                beads[:, :2]
-                - barrier_center.reshape(1, 2)
-            ) @ tangent
-            max_abs_tangent_coordinate = float(
-                np.max(
-                    np.abs(tangent_coordinates)
-                )
-            )
-            required_barrier_width = float(
-                2.0 * (
-                    max_abs_tangent_coordinate
-                    + bounding_radius
-                )
-            )
-            optimally_centered_required_width = float(
-                tangent_max
-                - tangent_min
-                + 2.0 * bounding_radius
-            )
-            coverage_margin = float(
-                config.barrier_width / 2
-                - max_abs_tangent_coordinate
-                - bounding_radius
             )
 
             probe_index = preferred_probe
@@ -706,61 +1003,24 @@ def evaluate_hidden_routing_gate_candidates(
                 "tangent_xy": (
                     tangent.astype(float).tolist()
                 ),
-                "tangent_projection_min": (
-                    _json_float(tangent_min)
-                ),
-                "tangent_projection_max": (
-                    _json_float(tangent_max)
-                ),
-                "tangent_projection_midpoint": (
-                    _json_float(
-                        tangent_midpoint
-                    )
-                ),
-                "barrier_center_tangent_coordinate": (
-                    _json_float(
-                        centered_tangent_coordinate
-                    )
-                ),
-                "barrier_tangent_center_error": (
-                    _json_float(
-                        tangent_center_error
-                    )
-                ),
-                "max_abs_tangent_coordinate": (
-                    _json_float(
-                        max_abs_tangent_coordinate
-                    )
-                ),
-                "configured_barrier_width": (
-                    _json_float(
-                        config.barrier_width
-                    )
-                ),
-                "required_barrier_width": (
-                    _json_float(
-                        required_barrier_width
-                    )
-                ),
-                "optimally_centered_required_width": (
-                    _json_float(
-                        optimally_centered_required_width
-                    )
-                ),
-                "barrier_width_shortfall": (
-                    _json_float(
-                        max(
-                            0.0,
-                            required_barrier_width
-                            - config.barrier_width,
+                **{
+                    key: (
+                        _json_float(value)
+                        if isinstance(
+                            value,
+                            (
+                                float,
+                                int,
+                                np.floating,
+                                np.integer,
+                            ),
                         )
+                        else value
                     )
-                ),
-                "coverage_margin": (
-                    _json_float(
-                        coverage_margin
-                    )
-                ),
+                    for key, value
+                    in barrier_geometry.items()
+                    if key != "barrier"
+                },
                 "workspace_margin": (
                     _json_float(
                         workspace_margin
@@ -827,6 +1087,21 @@ def evaluate_hidden_routing_gate_candidates(
         "audit_version": (
             "hidden_routing_gate_"
             "geometry_audit_v1"
+        ),
+        "barrier_mode": str(
+            config.barrier_mode
+        ),
+        "configured_barrier_width": float(
+            config.barrier_width
+        ),
+        "resolved_barrier_width": float(
+            config.resolved_barrier_width
+        ),
+        "corridor_required_width": float(
+            config.corridor_required_width
+        ),
+        "barrier_safety_margin": float(
+            config.barrier_safety_margin
         ),
         "topology_id": str(
             config.topology_id
@@ -936,7 +1211,32 @@ def compute_hidden_routing_gate_layout(
     return {
         "snapshot_version": (
             "ccda_hidden_routing_gate_"
+            "layout_v1r2"
+            if (
+                str(config.barrier_mode)
+                == ENDPOINT_CORRIDOR_BARRIER_MODE
+            )
+            else
+            "ccda_hidden_routing_gate_"
             "layout_v1r1"
+        ),
+        "barrier_mode": str(
+            selected["barrier_mode"]
+        ),
+        "coverage_reference": str(
+            selected["coverage_reference"]
+        ),
+        "resolved_barrier_width": float(
+            selected["resolved_barrier_width"]
+        ),
+        "corridor_required_width": float(
+            config.corridor_required_width
+        ),
+        "barrier_safety_margin": float(
+            selected["barrier_safety_margin"]
+        ),
+        "full_cable_required_width_diagnostic": float(
+            selected["full_cable_required_width_diagnostic"]
         ),
         "topology": str(
             config.topology_id
@@ -1018,4 +1318,3 @@ def compute_hidden_routing_gate_layout(
         # public_routing_layout() never exposes it.
         "geometry_audit": audit,
     }
-

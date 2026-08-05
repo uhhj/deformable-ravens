@@ -11,6 +11,7 @@ from ravens.tasks.ccda_hidden_hook_cable import (
     CCDAHiddenHookCable,
 )
 from ravens.tasks.ccda_hidden_routing_gate_geometry import (
+    WHOLE_CABLE_BARRIER_MODE,
     HiddenRoutingGateGeometryConfig,
     compute_hidden_routing_gate_layout,
     public_routing_layout,
@@ -74,6 +75,14 @@ class CCDAHiddenRoutingGateCable(
             barrier_width=self._env_float(
                 "CCDA_ROUTING_BARRIER_WIDTH",
                 "0.340",
+            ),
+            barrier_mode=os.environ.get(
+                "CCDA_ROUTING_BARRIER_MODE",
+                WHOLE_CABLE_BARRIER_MODE,
+            ),
+            barrier_safety_margin=self._env_float(
+                "CCDA_ROUTING_BARRIER_SAFETY_MARGIN",
+                "0.0",
             ),
             barrier_height=self._env_float(
                 "CCDA_ROUTING_BARRIER_HEIGHT",
@@ -351,4 +360,3 @@ class CCDAHiddenRoutingGateCable(
             "target_zone_has_collision": False,
         }
         return result
-
