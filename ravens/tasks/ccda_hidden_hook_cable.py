@@ -222,6 +222,12 @@ class CCDAHiddenHookCable(CCDAHiddenFrictionCable):
             "contact_mean_speed": oracle["mean_speed"],
             "sensor_joint_motor_torque": sensor["joint_motor_torque"],
             "sensor_joint_motor_torque_norm": sensor["joint_motor_torque_norm"],
+            "sensor_joint_reaction_force_torque": sensor[
+                "joint_reaction_force_torque"
+            ],
+            "sensor_joint_reaction_force_torque_norm": sensor[
+                "joint_reaction_force_torque_norm"
+            ],
             "sensor_suction_force_xyz": sensor["suction_force_xyz"],
             "sensor_suction_force_norm": sensor["suction_force_norm"],
             "sensor_suction_torque_xyz": sensor["suction_torque_xyz"],

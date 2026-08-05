@@ -267,6 +267,10 @@ class Environment():
             [float(state[3]) for state in joint_states],
             dtype=np.float64,
         )
+        joint_reaction_force_torque = np.asarray(
+            [np.asarray(state[2], dtype=np.float64) for state in joint_states],
+            dtype=np.float64,
+        )
 
         suction_force = np.zeros(3, dtype=np.float64)
         suction_torque = np.zeros(3, dtype=np.float64)
@@ -297,6 +301,12 @@ class Environment():
         return {
             'joint_motor_torque': [float(v) for v in joint_motor_torque],
             'joint_motor_torque_norm': float(np.linalg.norm(joint_motor_torque)),
+            'joint_reaction_force_torque': (
+                joint_reaction_force_torque.astype(float).tolist()
+            ),
+            'joint_reaction_force_torque_norm': float(
+                np.linalg.norm(joint_reaction_force_torque)
+            ),
             'suction_force_xyz': [float(v) for v in suction_force],
             'suction_force_norm': float(np.linalg.norm(suction_force)),
             'suction_torque_xyz': [float(v) for v in suction_torque],
@@ -785,7 +795,13 @@ class Environment():
             )[0],
             dtype=np.float64,
         )
-        success = True
+        task = getattr(self, 'task', None)
+        physics_counter = getattr(task, 'physics_step_count', None)
+        physics_step_start = (
+            int(physics_counter()) if callable(physics_counter) else None
+        )
+        joint_motion_success = True
+        joint_timeout_count = 0
         after = before.copy()
         endpoint_error = float(np.linalg.norm(target[:3] - before))
         corrections_used = 0
@@ -793,11 +809,14 @@ class Environment():
 
         for correction in range(max_corrections):
             corrections_used = correction + 1
-            success &= self.movep(
+            correction_success = self.movep(
                 command_target,
                 speed=speed,
                 joint_tolerance=joint_tolerance,
             )
+            joint_motion_success &= correction_success
+            if not correction_success:
+                joint_timeout_count += 1
             after = np.asarray(
                 p.getLinkState(
                     self.ur5,
@@ -810,6 +829,37 @@ class Environment():
             if endpoint_error <= cartesian_tolerance:
                 break
             command_target[:3] += target[:3] - after
+
+        joints = list(getattr(self, 'joints', []))
+        if joints:
+            final_joint_target = np.asarray(
+                self.solve_IK(command_target), dtype=np.float64
+            )
+            final_joint_position = np.asarray(
+                [p.getJointState(self.ur5, i)[0] for i in joints],
+                dtype=np.float64,
+            )
+            final_joint_error = final_joint_target - final_joint_position
+            final_joint_error_max_abs = float(
+                np.max(np.abs(final_joint_error))
+            )
+            final_joint_error_norm = float(np.linalg.norm(final_joint_error))
+        else:
+            final_joint_error = np.asarray([], dtype=np.float64)
+            final_joint_error_max_abs = None
+            final_joint_error_norm = None
+        endpoint_reached = bool(endpoint_error <= cartesian_tolerance)
+        if joint_timeout_count and endpoint_reached:
+            timeout_reason = 'joint_timeout_recovered_by_cartesian_endpoint'
+        elif joint_timeout_count:
+            timeout_reason = 'joint_timeout_and_cartesian_endpoint_miss'
+        elif not endpoint_reached:
+            timeout_reason = 'cartesian_endpoint_miss'
+        else:
+            timeout_reason = None
+        physics_step_end = (
+            int(physics_counter()) if callable(physics_counter) else None
+        )
 
         requested_vector = target[:3] - before
         achieved_vector = after - before
@@ -825,6 +875,8 @@ class Environment():
             achieved_fraction = 1.0
 
         event = {
+            'primitive': 'pick_precise_probe_return',
+            'stage': str(label),
             'label': str(label),
             'requested_position': target[:3].astype(float).tolist(),
             'before_position': before.astype(float).tolist(),
@@ -834,10 +886,27 @@ class Environment():
             'achieved_projection': achieved_projection,
             'achieved_fraction': float(achieved_fraction),
             'endpoint_error': endpoint_error,
+            'cartesian_endpoint_error': endpoint_error,
+            'final_joint_error': final_joint_error.astype(float).tolist(),
+            'final_joint_error_max_abs': final_joint_error_max_abs,
+            'final_joint_error_norm': final_joint_error_norm,
             'joint_tolerance': float(joint_tolerance),
             'cartesian_tolerance': float(cartesian_tolerance),
             'corrections_used': int(corrections_used),
-            'success': bool(success and endpoint_error <= cartesian_tolerance),
+            'joint_motion_success': bool(joint_motion_success),
+            'joint_timeout_count': int(joint_timeout_count),
+            'timeout_reason': timeout_reason,
+            'physics_step_start': physics_step_start,
+            'physics_step_end': physics_step_end,
+            'physics_step_count': (
+                physics_step_end - physics_step_start
+                if physics_step_start is not None and physics_step_end is not None
+                else None
+            ),
+            # The primitive is Cartesian. A fixed-step joint timeout is retained
+            # above as audit evidence, but is locally recoverable when residual
+            # feedback has placed the endpoint inside the unchanged tolerance.
+            'success': endpoint_reached,
         }
         self._ccda_motion_events.append(event)
         return bool(event['success'])

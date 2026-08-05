@@ -100,6 +100,13 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
             super().reset(env, last_info=last_info)
         finally:
             self._name = formal_name
+        # PyBullet returns zero joint reaction wrench unless the sensor is
+        # explicitly enabled. This is a robot-observable channel and is used
+        # only by the CCDA sensor audit, never as privileged task state.
+        for joint in env.joints:
+            p.enableJointForceTorqueSensor(
+                int(env.ur5), int(joint), enableSensor=True
+            )
         # Environment.reset() calls arm_hidden_friction_after_settle() only
         # after its visible, force-free settling step has completed.
         self._hidden_friction_pending = True
@@ -390,6 +397,12 @@ class CCDAHiddenFrictionCable(CableLineNoTarget):
                 "contact_mean_speed": oracle["mean_speed"],
                 "sensor_joint_motor_torque": sensor["joint_motor_torque"],
                 "sensor_joint_motor_torque_norm": sensor["joint_motor_torque_norm"],
+                "sensor_joint_reaction_force_torque": sensor[
+                    "joint_reaction_force_torque"
+                ],
+                "sensor_joint_reaction_force_torque_norm": sensor[
+                    "joint_reaction_force_torque_norm"
+                ],
                 "sensor_suction_force_xyz": sensor["suction_force_xyz"],
                 "sensor_suction_force_norm": sensor["suction_force_norm"],
                 "sensor_suction_torque_xyz": sensor["suction_torque_xyz"],
