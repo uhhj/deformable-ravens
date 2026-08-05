@@ -52,7 +52,8 @@ class Environment():
                            'pick_place': self.pick_place,
                            'pick_probe_return': self.pick_probe_return,
                            'pick_planar_microprobe': self.pick_planar_microprobe,
-                           'pick_precise_probe_return': self.pick_precise_probe_return}
+                           'pick_precise_probe_return': self.pick_precise_probe_return,
+                           'pick_precise_latch_probe': self.pick_precise_latch_probe}
 
         self._ccda_video_recorder = None
         self._ccda_video_label = ""
@@ -240,6 +241,34 @@ class Environment():
 
     def ccda_motion_events(self):
         return [dict(event) for event in self._ccda_motion_events]
+
+    def _record_ccda_hold_event(
+            self,
+            *,
+            primitive,
+            stage,
+            physics_step_start,
+            physics_step_end):
+        self._ccda_motion_events.append({
+            'primitive': str(primitive),
+            'stage': str(stage),
+            'label': str(stage),
+            'physics_step_start': int(physics_step_start),
+            'physics_step_end': int(physics_step_end),
+            'physics_step_count': int(
+                physics_step_end - physics_step_start
+            ),
+            'timeout_reason': None,
+            'joint_timeout_count': 0,
+            'joint_motion_success': True,
+            'cartesian_endpoint_error': 0.0,
+            'final_joint_error': [],
+            'final_joint_error_max_abs': 0.0,
+            'final_joint_error_norm': 0.0,
+            'achieved_fraction': 1.0,
+            'success': True,
+            'event_kind': 'hold',
+        })
 
     def record_ccda_frame(self, label=""):
         """Public frame-capture entry point for idle simulation phases."""
@@ -774,7 +803,8 @@ class Environment():
             joint_tolerance=1e-4,
             cartesian_tolerance=2e-4,
             max_corrections=3,
-            label='precise_move'):
+            label='precise_move',
+            primitive='pick_precise_probe_return'):
         if not self.deterministic:
             raise RuntimeError('movep_precise requires deterministic execution')
 
@@ -875,7 +905,7 @@ class Environment():
             achieved_fraction = 1.0
 
         event = {
-            'primitive': 'pick_precise_probe_return',
+            'primitive': str(primitive),
             'stage': str(label),
             'label': str(label),
             'requested_position': target[:3].astype(float).tolist(),
@@ -1434,6 +1464,130 @@ class Environment():
         self.ee.release()
         if post_release_steps:
             self.step_physics(int(post_release_steps))
+
+        retreat = release_pose.copy()
+        retreat[2] = float(retreat_z)
+        success &= self.movep(retreat, speed=speed)
+        return bool(success)
+
+    def pick_precise_latch_probe(
+            self,
+            pose0,
+            lift_height=0.004,
+            hold_steps=60,
+            return_hold_steps=60,
+            post_release_steps=120,
+            approach_height=0.02,
+            retreat_z=0.3,
+            joint_tolerance=1e-4,
+            cartesian_tolerance=2e-4,
+            min_achieved_fraction=0.8):
+        if not self.deterministic:
+            raise RuntimeError('pick_precise_latch_probe requires fixed-step mode')
+        if lift_height <= 0:
+            raise ValueError('lift_height must be positive')
+        if min(hold_steps, return_hold_steps, post_release_steps) < 0:
+            raise ValueError('hold steps must be non-negative')
+
+        primitive = 'pick_precise_latch_probe'
+        speed = 0.001
+        delta_z = -0.0005
+        if hasattr(self.task, 'primitive_params'):
+            params = self.task.primitive_params[self.task.task_stage]
+            speed = float(params.get('speed', speed))
+            delta_z = float(params.get('delta_z', delta_z))
+        if delta_z >= 0:
+            raise ValueError('delta_z must be negative')
+
+        deformable_ids = getattr(self.task, 'def_IDs', [])
+        pick = np.asarray(pose0[0], dtype=np.float64)
+        rotation = np.asarray(pose0[1], dtype=np.float64)
+        success = True
+        approach = np.hstack((
+            [pick[0], pick[1], pick[2] + approach_height], rotation
+        ))
+        success &= self.movep(approach, speed=speed)
+
+        lower = approach.copy()
+        floor_limit = max(0.0, float(pick[2]) - 0.01)
+        while not self.ee.detect_contact(deformable_ids) and lower[2] > floor_limit:
+            lower[2] += delta_z
+            success &= self.movep(
+                lower, speed=speed, joint_tolerance=joint_tolerance
+            )
+            if not success:
+                return False
+
+        self.ee.activate(self.objects, deformable_ids)
+        if not self.ee.check_grasp():
+            self.ee.release()
+            return False
+
+        grasp_tip = np.asarray(
+            p.getLinkState(
+                self.ur5, self.ee_tip_link, computeForwardKinematics=True
+            )[0],
+            dtype=np.float64,
+        )
+        lift = np.hstack((
+            [grasp_tip[0], grasp_tip[1], grasp_tip[2] + float(lift_height)],
+            rotation,
+        ))
+        success &= self.movep_precise(
+            lift,
+            speed=speed,
+            joint_tolerance=joint_tolerance,
+            cartesian_tolerance=cartesian_tolerance,
+            label='latch_probe_lift',
+            primitive=primitive,
+        )
+        if self._ccda_motion_events[-1]['achieved_fraction'] < min_achieved_fraction:
+            success = False
+
+        counter = getattr(self.task, 'physics_step_count', None)
+        if not callable(counter):
+            raise RuntimeError('latch probe task has no physics step counter')
+        hold_start = int(counter())
+        if hold_steps:
+            self.step_physics(int(hold_steps))
+        self._record_ccda_hold_event(
+            primitive=primitive,
+            stage='latch_probe_hold',
+            physics_step_start=hold_start,
+            physics_step_end=int(counter()),
+        )
+
+        release_pose = np.hstack((
+            [grasp_tip[0], grasp_tip[1], grasp_tip[2]], rotation
+        ))
+        success &= self.movep_precise(
+            release_pose,
+            speed=speed,
+            joint_tolerance=joint_tolerance,
+            cartesian_tolerance=cartesian_tolerance,
+            label='latch_probe_lower_release',
+            primitive=primitive,
+        )
+        return_start = int(counter())
+        if return_hold_steps:
+            self.step_physics(int(return_hold_steps))
+        self._record_ccda_hold_event(
+            primitive=primitive,
+            stage='latch_probe_return_hold',
+            physics_step_start=return_start,
+            physics_step_end=int(counter()),
+        )
+
+        self.ee.release()
+        post_start = int(counter())
+        if post_release_steps:
+            self.step_physics(int(post_release_steps))
+        self._record_ccda_hold_event(
+            primitive=primitive,
+            stage='latch_probe_post_release',
+            physics_step_start=post_start,
+            physics_step_end=int(counter()),
+        )
 
         retreat = release_pose.copy()
         retreat[2] = float(retreat_z)

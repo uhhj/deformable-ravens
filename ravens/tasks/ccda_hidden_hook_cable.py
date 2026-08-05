@@ -52,8 +52,8 @@ class CCDAHiddenHookCable(CCDAHiddenFrictionCable):
         super().reset(env, last_info=last_info)
         self._hook_body_ids = []
         self._hook_visual_shape_indices = []
-        self._hook_layout = compute_hidden_hook_layout(
-            self._ordered_bead_positions(), self._hook_config()
+        self._hook_layout = self._compute_hidden_layout(
+            self._ordered_bead_positions()
         )
         self._hook_collision_enabled = False
         self._initial_hook_clearance = None
@@ -64,16 +64,20 @@ class CCDAHiddenHookCable(CCDAHiddenFrictionCable):
             raise ValueError("minimum hook clearance must be positive")
         self._create_invisible_hook()
 
+    def _compute_hidden_layout(self, positions):
+        return compute_hidden_hook_layout(positions, self._hook_config())
+
     def _create_invisible_hook(self):
         for box in self._hook_layout["boxes"]:
             half = [float(value) for value in box["half_extents"]]
             collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
             center = box["center_xy"]
+            center_z = float(box.get("center_z", half[2]))
             body_id = int(p.createMultiBody(
                 baseMass=0.0,
                 baseCollisionShapeIndex=collision,
                 baseVisualShapeIndex=-1,
-                basePosition=(float(center[0]), float(center[1]), half[2]),
+                basePosition=(float(center[0]), float(center[1]), center_z),
                 baseOrientation=p.getQuaternionFromEuler((0, 0, float(box["yaw"]))),
             ))
             self._hook_body_ids.append(body_id)
@@ -92,9 +96,10 @@ class CCDAHiddenHookCable(CCDAHiddenFrictionCable):
         for hook_id, box in zip(self._hook_body_ids, self._hook_layout["boxes"]):
             half = [float(value) for value in box["half_extents"]]
             center = box["center_xy"]
+            center_z = float(box.get("center_z", half[2]))
             p.resetBasePositionAndOrientation(
                 int(hook_id),
-                (float(center[0]), float(center[1]), half[2]),
+                (float(center[0]), float(center[1]), center_z),
                 p.getQuaternionFromEuler((0, 0, float(box["yaw"]))),
             )
 
@@ -112,9 +117,7 @@ class CCDAHiddenHookCable(CCDAHiddenFrictionCable):
         if self._hidden_friction_armed:
             return {"already_armed": True}
         before = self._ordered_bead_positions()
-        self._hook_layout = compute_hidden_hook_layout(
-            before, self._hook_config()
-        )
+        self._hook_layout = self._compute_hidden_layout(before)
         self._position_hook_bodies()
         clearance = self._minimum_hook_cable_distance()
         if clearance < self._minimum_initial_clearance:
