@@ -17,7 +17,13 @@ from ravens import tasks, utils
 
 class Environment():
 
-    def __init__(self, disp=False, hz=240):
+    def __init__(
+            self,
+            disp=False,
+            hz=240,
+            deterministic=False,
+            control_substeps=1,
+            post_action_settle_steps=0):
         """Creates OpenAI gym-style env with support for PyBullet threading.
 
         Args:
@@ -42,13 +48,27 @@ class Environment():
         self.primitives = {'push':       self.push,
                            'sweep':      self.sweep,
                            'pick_place': self.pick_place}
+        self._ccda_step_lock = threading.RLock()
+        self._ccda_physics_hook_error = None
+        self._stop_event = threading.Event()
+        self._ccda_video_recorder = None
+        self._ccda_video_label = ''
 
         # Set default movej timeout limit. For most tasks, 15 is reasonable.
         self.t_lim = 15
 
         # From Xuchen: need this for using any new deformable simulation.
         self.use_new_deformable = True
-        self.hz = hz
+        self.hz = int(hz)
+        self.deterministic = bool(deterministic)
+        self.control_substeps = int(control_substeps)
+        self.post_action_settle_steps = int(post_action_settle_steps)
+        if self.hz <= 0:
+            raise ValueError('hz must be positive')
+        if self.control_substeps <= 0:
+            raise ValueError('control_substeps must be positive')
+        if self.post_action_settle_steps < 0:
+            raise ValueError('post_action_settle_steps must be non-negative')
 
         # Start PyBullet.
         p.connect(p.GUI if disp else p.DIRECT)
@@ -56,6 +76,7 @@ class Environment():
         p.setPhysicsEngineParameter(enableFileCaching=0)
         assets_path = os.path.dirname(os.path.abspath(__file__))
         p.setAdditionalSearchPath(assets_path)
+        p.setTimeStep(1.0 / self.hz)
 
         # Check PyBullet version (see also the cloth/bag task scripts!).
         p_version = pkg_resources.get_distribution('pybullet').version
@@ -73,9 +94,75 @@ class Environment():
                 cameraTargetPosition=target,)
 
         # Control PyBullet simulation steps.
-        self.step_thread = threading.Thread(target=self.step_simulation)
-        self.step_thread.daemon = True
-        self.step_thread.start()
+        self.step_thread = None
+        if not self.deterministic:
+            self.step_thread = threading.Thread(target=self.step_simulation)
+            self.step_thread.daemon = True
+            self.step_thread.start()
+
+    def _step_physics_once_unlocked(self):
+        """Run one physics tick and task instrumentation in fixed order."""
+        task = getattr(self, 'task', None)
+        pre_hook = getattr(task, 'physics_pre_step_hook', None)
+        if callable(pre_hook):
+            try:
+                pre_hook()
+            except Exception as exc:
+                self._ccda_physics_hook_error = (
+                    'physics_pre_step_hook: ' + repr(exc))
+                self._raise_ccda_physics_hook_error()
+
+        p.stepSimulation()
+        if self.ee is not None:
+            self.ee.step()
+
+        post_hook = getattr(task, 'physics_step_hook', None)
+        if callable(post_hook):
+            try:
+                post_hook()
+            except Exception as exc:
+                self._ccda_physics_hook_error = (
+                    'physics_step_hook: ' + repr(exc))
+                self._raise_ccda_physics_hook_error()
+
+        self._ccda_record_frame()
+
+    def _raise_ccda_physics_hook_error(self):
+        if self._ccda_physics_hook_error is not None:
+            raise RuntimeError(self._ccda_physics_hook_error)
+
+    def step_physics(self, steps=1):
+        """Advance an exact number of ticks without a wall-clock boundary."""
+        steps = int(steps)
+        if steps < 0:
+            raise ValueError('steps must be non-negative')
+        if not self.deterministic and self.running:
+            raise RuntimeError(
+                'step_physics requires the threaded environment to be paused')
+        with self._ccda_step_lock:
+            for _ in range(steps):
+                self._step_physics_once_unlocked()
+                self._raise_ccda_physics_hook_error()
+
+    def wait_seconds(self, seconds):
+        seconds = float(seconds)
+        if seconds < 0:
+            raise ValueError('seconds must be non-negative')
+        if self.deterministic:
+            self.step_physics(int(round(seconds * self.hz)))
+        else:
+            time.sleep(seconds)
+
+    def settle_for_seconds(self, seconds):
+        seconds = float(seconds)
+        if seconds < 0:
+            raise ValueError('seconds must be non-negative')
+        if self.deterministic:
+            self.step_physics(int(round(seconds * self.hz)))
+        else:
+            self.start()
+            time.sleep(seconds)
+            self.pause()
 
     def step_simulation(self):
         """Adding optional hertz parameter for better cloth physics.
@@ -85,22 +172,108 @@ class Environment():
         visualize PyBullet with the GUI to make it not move too fast
         """
         p.setTimeStep(1.0 / self.hz)
-        while True:
+        while not self._stop_event.is_set():
             if self.running:
-                p.stepSimulation()
-            if self.ee is not None:
-                self.ee.step()
+                with self._ccda_step_lock:
+                    self._step_physics_once_unlocked()
             time.sleep(0.001)
 
     def stop(self):
-        p.disconnect()
-        del self.step_thread
+        self.running = False
+        self._stop_event.set()
+        if self.step_thread is not None and self.step_thread.is_alive():
+            self.step_thread.join(timeout=1.0)
+        with self._ccda_step_lock:
+            if p.isConnected():
+                p.disconnect()
 
     def start(self):
         self.running = True
 
     def pause(self):
         self.running = False
+
+    def reset_ccda_runtime_after_restore(self):
+        """Clear instrumentation state; grasp state is restored by the runner."""
+        self._ccda_physics_hook_error = None
+        self._ccda_video_label = ''
+        recorder = self._ccda_video_recorder
+        reset_label = getattr(recorder, 'reset_phase_label', None)
+        if callable(reset_label):
+            reset_label()
+
+    def set_ccda_video_recorder(self, recorder):
+        self._ccda_video_recorder = recorder
+        self._ccda_video_label = ''
+        bind = getattr(recorder, 'bind', None)
+        if callable(bind):
+            bind(self)
+
+    def record_ccda_frame(self, label=''):
+        self._ccda_record_frame(label)
+
+    def _ccda_record_frame(self, label=''):
+        recorder = self._ccda_video_recorder
+        if label:
+            self._ccda_video_label = str(label)
+        if recorder is not None:
+            recorder.record(self._ccda_video_label)
+
+    @staticmethod
+    def _ccda_execution_status(
+            *, action_executed, action_completed, primitive_succeeded,
+            task_success, episode_terminated, termination_reason):
+        return {
+            'action_executed': bool(action_executed),
+            'action_completed': bool(action_completed),
+            'primitive_succeeded': (
+                None if primitive_succeeded is None
+                else bool(primitive_succeeded)),
+            'task_success': bool(task_success),
+            'episode_terminated': bool(episode_terminated),
+            'termination_reason': termination_reason,
+        }
+
+    def ccda_sensor_observation(self):
+        """Return robot-observable wrench proxies without task oracle state."""
+        joint_states = [
+            p.getJointState(self.ur5, int(joint)) for joint in self.joints]
+        motor_torque = np.asarray(
+            [state[3] for state in joint_states], dtype=np.float64)
+        reaction_wrench = np.asarray(
+            [state[2] for state in joint_states], dtype=np.float64)
+
+        suction_force = np.zeros(3, dtype=np.float64)
+        suction_torque = np.zeros(3, dtype=np.float64)
+        constraint_available = False
+        ee = self.ee
+        constraint = getattr(ee, 'contact_constraint', None)
+        if constraint is not None:
+            try:
+                state = np.asarray(
+                    p.getConstraintState(int(constraint)), dtype=np.float64)
+                if state.size >= 3:
+                    suction_force[:] = state[:3]
+                    constraint_available = True
+                if state.size >= 6:
+                    suction_torque[:] = state[3:6]
+            except Exception:
+                constraint_available = False
+
+        return {
+            'joint_motor_torque': motor_torque.astype(float).tolist(),
+            'joint_motor_torque_norm': float(np.linalg.norm(motor_torque)),
+            'joint_reaction_force_torque': reaction_wrench.astype(float).tolist(),
+            'joint_reaction_force_torque_norm': float(
+                np.linalg.norm(reaction_wrench)),
+            'suction_force_xyz': suction_force.astype(float).tolist(),
+            'suction_force_norm': float(np.linalg.norm(suction_force)),
+            'suction_torque_xyz': suction_torque.astype(float).tolist(),
+            'suction_torque_norm': float(np.linalg.norm(suction_torque)),
+            'grasp_active': int(bool(
+                ee is not None and getattr(ee, 'activated', False))),
+            'constraint_available': int(constraint_available),
+        }
 
     def is_static(self):
         """Checks if env is static, used for checking if action finished.
@@ -152,6 +325,7 @@ class Environment():
                 becoming a time bottleneck, judging from my profiling.
         """
         self.pause()
+        self._ccda_physics_hook_error = None
         self.task = task
         self.objects = []
         self.fixed_objects = []
@@ -263,19 +437,33 @@ class Environment():
         with ground truth agents, there is no 'second action lacking a primitive',
         because ground truth agents don't need images (see their `act` method).
         """
-        if act and act['primitive']:
-            success = self.primitives[act['primitive']](**act['params'])
+        action_executed = bool(act and act['primitive'])
+        primitive_succeeded = None
+        if action_executed:
+            primitive_succeeded = bool(
+                self.primitives[act['primitive']](**act['params']))
 
             # Exit early if action failed. Daniel: adding exit_gracefully.
-            if (not success) or self.task.exit_gracefully:
+            exit_gracefully = bool(self.task.exit_gracefully)
+            if (not primitive_succeeded) or exit_gracefully:
                 _, reward_extras = self.task.reward()
                 info = self.info
                 reward_extras['task.done'] = False
 
                 # Means we hit irrecoverable action, exit now (reset to False!!).
-                if self.task.exit_gracefully:
+                if exit_gracefully:
                     reward_extras['exit_gracefully'] = True
                     self.task.exit_gracefully = False  # important !!!
+
+                status = self._ccda_execution_status(
+                    action_executed=True,
+                    action_completed=True,
+                    primitive_succeeded=primitive_succeeded,
+                    task_success=False,
+                    episode_terminated=True,
+                    termination_reason=(
+                        'primitive_failed' if not primitive_succeeded
+                        else 'task_exit_gracefully'))
 
                 # For consistency?
                 if isinstance(self.task, tasks.names['cloth-flat-notarget']):
@@ -286,26 +474,39 @@ class Environment():
                     info['bag_target_color'] = self.task.bag_colors[0]
 
                 info['extras'] = reward_extras
+                info['ccda_execution_status'] = status
                 return {}, 0, True, info
 
         # Wait for objects to settle, with a hard exit for bag tasks.
-        start_t = time.time()
-        while not self.is_static():
-            if self.is_bag_env() and (time.time() - start_t > 2.0):
-                break
-            time.sleep(0.001)
+        if self.deterministic:
+            if action_executed and self.post_action_settle_steps:
+                self.step_physics(self.post_action_settle_steps)
+        else:
+            start_t = time.time()
+            while not self.is_static():
+                if self.is_bag_env() and (time.time() - start_t > 2.0):
+                    break
+                time.sleep(0.001)
 
         # Compute task rewards.
         reward, reward_extras = self.task.reward()
-        done = self.task.done()
+        task_success = bool(self.task.done())
+        status = self._ccda_execution_status(
+            action_executed=action_executed,
+            action_completed=action_executed,
+            primitive_succeeded=(True if action_executed else None),
+            task_success=task_success,
+            episode_terminated=task_success,
+            termination_reason=('task_success' if task_success else None))
 
         # Pass ground truth robot state as info.
         info = self.info
 
         # Daniel: fine-grained info about rewards (since it's nuanced for some tasks).
         # If we hit time limit, `task.done` will check if we succeeded on last action.
-        reward_extras['task.done'] = done
+        reward_extras['task.done'] = task_success
         info['extras'] = reward_extras
+        info['ccda_execution_status'] = status
         if isinstance(self.task, tasks.names['cloth-flat-notarget']):
             info['sampled_zone_pose'] = self.task.zone_pose
         elif isinstance(self.task, tasks.names['bag-color-goal']):
@@ -322,7 +523,7 @@ class Environment():
                 obs['color'].append(color)
                 obs['depth'].append(depth)
 
-        return obs, reward, done, info
+        return obs, reward, status['episode_terminated'], info
 
     def render(self, config):
         """Render RGB-D image with specified configuration."""
@@ -444,20 +645,63 @@ class Environment():
     # Robot Movement Functions
     #-------------------------------------------------------------------------
 
-    def movej(self, targj, speed=0.01, t_lim=20):
+    def _movej_fixed(self, targj, speed=0.01, t_lim=20,
+                     joint_tolerance=None):
+        targj = np.asarray(targj, dtype=np.float64)
+        speed = float(speed)
+        tolerance = 1e-2 if joint_tolerance is None else float(joint_tolerance)
+        if speed <= 0:
+            raise ValueError('movej speed must be positive')
+        if tolerance <= 0:
+            raise ValueError('joint_tolerance must be positive')
+
+        max_physics_steps = int(round(float(t_lim) * self.hz))
+        physics_steps = 0
+        while physics_steps < max_physics_steps:
+            currj = np.asarray([
+                p.getJointState(self.ur5, i)[0] for i in self.joints],
+                dtype=np.float64)
+            diffj = targj - currj
+            if np.all(np.abs(diffj) < tolerance):
+                return True
+            norm = float(np.linalg.norm(diffj))
+            velocity = diffj / norm if norm else np.zeros_like(diffj)
+            stepj = currj + velocity * min(speed, norm)
+            p.setJointMotorControlArray(
+                bodyIndex=self.ur5,
+                jointIndices=self.joints,
+                controlMode=p.POSITION_CONTROL,
+                targetPositions=stepj,
+                positionGains=np.ones(len(self.joints)))
+            remaining = max_physics_steps - physics_steps
+            substeps = min(self.control_substeps, remaining)
+            self.step_physics(substeps)
+            physics_steps += substeps
+        print('Warning: deterministic movej exceeded {} physics steps.'.format(
+            max_physics_steps))
+        return False
+
+    def movej(self, targj, speed=0.01, t_lim=20, joint_tolerance=None):
         """Move UR5 to target joint configuration."""
+        tolerance = 1e-2 if joint_tolerance is None else float(joint_tolerance)
+        if tolerance <= 0:
+            raise ValueError('joint_tolerance must be positive')
+        if self.deterministic:
+            return self._movej_fixed(
+                targj, speed, t_lim, joint_tolerance=tolerance)
+
         t0 = time.time()
         while (time.time() - t0) < t_lim:
             currj = [p.getJointState(self.ur5, i)[0] for i in self.joints]
             currj = np.array(currj)
             diffj = targj - currj
-            if all(np.abs(diffj) < 1e-2):
+            if all(np.abs(diffj) < tolerance):
                 return True
 
             # Move with constant velocity
             norm = np.linalg.norm(diffj)
             v = diffj / norm if norm > 0 else 0
-            stepj = currj + v * speed
+            stepj = currj + v * min(speed, norm)
             gains = np.ones(len(self.joints))
             p.setJointMotorControlArray(
                 bodyIndex=self.ur5,
@@ -469,12 +713,13 @@ class Environment():
         print('Warning: movej exceeded {} sec timeout. Skipping.'.format(t_lim))
         return False
 
-    def movep(self, pose, speed=0.01):
+    def movep(self, pose, speed=0.01, joint_tolerance=None):
         """Move UR5 to target end effector pose."""
         # # Keep joint angles between -180/+180
         # targj[5] = ((targj[5] + np.pi) % (2 * np.pi) - np.pi)
         targj = self.solve_IK(pose)
-        return self.movej(targj, speed, self.t_lim)
+        return self.movej(
+            targj, speed, self.t_lim, joint_tolerance=joint_tolerance)
 
     def solve_IK(self, pose):
         homej_list = np.array(self.homej).tolist()
