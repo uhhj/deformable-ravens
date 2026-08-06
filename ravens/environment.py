@@ -939,7 +939,8 @@ class Environment():
                 isinstance(self.task, tasks.names['cable-shape-notarget']) or
                 isinstance(self.task, tasks.names['cable-line-notarget']) or
                 isinstance(self.task, tasks.names['cable-ring']) or
-                isinstance(self.task, tasks.names['cable-ring-notarget']))
+                isinstance(self.task, tasks.names['cable-ring-notarget']) or
+                isinstance(self.task, tasks.names['ccda-occp-audit']))
 
     def is_cloth_env(self):
         """Keep this updated when I adjust environment names."""
