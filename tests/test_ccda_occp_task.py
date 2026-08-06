@@ -22,6 +22,8 @@ def make_geometry(task):
     layout = compute_occp_layout(task.geometry_config, 'free')
     task.object_points = {}
     task._IDs = {}
+    task.cable_bead_IDs = []
+    task.cable_constraint_ids = []
     task._create_cable(env, layout)
     task._create_hidden_pin(layout)
     task._create_occluder(layout)
@@ -31,10 +33,9 @@ def make_geometry(task):
 
 def test_pin_is_collision_enabled_and_invisible_in_both_conditions(bullet_world):
     task = OCCPAuditCable()
-    _, _ = make_geometry(task)
+    make_geometry(task)
     assert p.getCollisionShapeData(task.pin_body_id, -1)
-    assert all(
-        visual[7][3] == 0.0 for visual in p.getVisualShapeData(task.pin_body_id))
+    assert all(v[7][3] == 0.0 for v in p.getVisualShapeData(task.pin_body_id))
     for condition in ('free', 'right_hidden_jam'):
         task.arm_condition(condition)
         assert p.getCollisionShapeData(task.pin_body_id, -1)
@@ -55,6 +56,16 @@ def test_passive_endpoint_is_fixed(bullet_world):
     assert p.getDynamicsInfo(task.cable_bead_IDs[-1], -1)[0] > 0.0
 
 
+def test_active_stabilizer_can_be_released(bullet_world):
+    task = OCCPAuditCable()
+    make_geometry(task)
+    constraint = task.active_endpoint_stabilizer_id
+    assert constraint is not None
+    assert p.getConstraintInfo(constraint)
+    task.release_active_endpoint_stabilizer()
+    assert task.active_endpoint_stabilizer_id is None
+
+
 def test_arm_does_not_advance_physics(bullet_world):
     task = OCCPAuditCable()
     make_geometry(task)
@@ -71,8 +82,9 @@ def test_occp_environment_reset_smoke():
         task.configure_audit(
             pair_id='smoke', seed=1, trace_stride=2, settle_seconds=0.01)
         env.reset(task)
-        assert len(task.cable_bead_IDs) == 24
+        assert len(task.cable_bead_IDs) == 28
         assert task.physics_step_count() == 0
+        assert task.active_endpoint_stabilizer_id is not None
         assert env.ccda_sensor_observation()['joint_motor_torque']
     finally:
         env.stop()

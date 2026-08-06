@@ -13,6 +13,13 @@ from ravens.tasks.ccda_occp_geometry import (
 )
 
 
+def _world_point_to_local(body_position, body_orientation, world_point):
+    inverse = p.invertTransform(body_position, body_orientation)
+    local, _ = p.multiplyTransforms(
+        inverse[0], inverse[1], world_point, [0, 0, 0, 1])
+    return local
+
+
 class OCCPAuditCable(CableEnv):
     def __init__(self):
         super().__init__()
@@ -26,6 +33,7 @@ class OCCPAuditCable(CableEnv):
         self.passive_endpoint_constraint_id = None
         self.pin_body_id = None
         self.occluder_body_id = None
+        self.active_endpoint_stabilizer_id = None
         self._physics_step_count = 0
         self._phase = 'no_action'
         self._trace = []
@@ -70,6 +78,7 @@ class OCCPAuditCable(CableEnv):
         self.passive_endpoint_constraint_id = None
         self.pin_body_id = None
         self.occluder_body_id = None
+        self.active_endpoint_stabilizer_id = None
         self.reset_branch_runtime('free')
         self._layout = compute_occp_layout(self.geometry_config, 'free')
         self._create_cable(env, self._layout)
@@ -87,25 +96,46 @@ class OCCPAuditCable(CableEnv):
 
     def _create_cable(self, env, layout):
         radius = self.geometry_config.cable_radius
-        spacing = layout['spacing']
+        positions = layout['bead_positions']
+        yaw = layout['bead_yaw']
+        half_length = 0.45 * layout['spacing']
         collision = p.createCollisionShape(
-            p.GEOM_BOX, halfExtents=[radius] * 3)
+            p.GEOM_BOX, halfExtents=[half_length, radius, radius])
         visual = p.createVisualShape(
             p.GEOM_SPHERE, radius=radius * 1.5,
             rgbaColor=utils.COLORS['blue'] + [1])
         endpoint_visual = p.createVisualShape(
             p.GEOM_SPHERE, radius=radius * 1.5,
             rgbaColor=utils.COLORS['yellow'] + [1])
-        for index, position in enumerate(layout['bead_positions']):
-            mass = 0.0 if index == 0 else self.geometry_config.bead_mass
+        orientations = [p.getQuaternionFromEuler(
+            [0.0, 0.0, float(value)]) for value in yaw]
+        for index, position in enumerate(positions):
+            mass = (0.0 if index == layout['passive_endpoint_index']
+                    else self.geometry_config.bead_mass)
             part_id = p.createMultiBody(
                 baseMass=mass,
                 baseCollisionShapeIndex=collision,
                 baseVisualShapeIndex=(
                     endpoint_visual if index == len(layout['bead_positions']) - 1
                     else visual),
-                basePosition=position.tolist())
+                basePosition=position.tolist(),
+                baseOrientation=orientations[index])
+            try:
+                p.changeDynamics(
+                    part_id, -1,
+                    lateralFriction=self.geometry_config.bead_lateral_friction,
+                    linearDamping=self.geometry_config.linear_damping,
+                    angularDamping=self.geometry_config.angular_damping,
+                    collisionMargin=self.geometry_config.collision_margin_m)
+            except TypeError as exc:
+                raise RuntimeError(
+                    'PyBullet does not support the required collisionMargin') from exc
             if index:
+                midpoint = 0.5 * (positions[index - 1] + positions[index])
+                parent_frame = _world_point_to_local(
+                    positions[index - 1], orientations[index - 1], midpoint)
+                child_frame = _world_point_to_local(
+                    positions[index], orientations[index], midpoint)
                 constraint_id = p.createConstraint(
                     parentBodyUniqueId=self.cable_bead_IDs[-1],
                     parentLinkIndex=-1,
@@ -113,14 +143,40 @@ class OCCPAuditCable(CableEnv):
                     childLinkIndex=-1,
                     jointType=p.JOINT_POINT2POINT,
                     jointAxis=(0, 0, 0),
-                    parentFramePosition=(spacing, 0, 0),
-                    childFramePosition=(0, 0, 0))
-                p.changeConstraint(constraint_id, maxForce=100)
+                    parentFramePosition=parent_frame,
+                    childFramePosition=child_frame)
+                p.changeConstraint(
+                    constraint_id,
+                    maxForce=self.geometry_config.constraint_max_force)
+                p.setCollisionFilterPair(
+                    self.cable_bead_IDs[-1], part_id, -1, -1,
+                    enableCollision=0)
                 self.cable_constraint_ids.append(int(constraint_id))
             self.cable_bead_IDs.append(int(part_id))
             env.objects.append(int(part_id))
             self.object_points[int(part_id)] = np.zeros((3, 1), dtype=np.float32)
             self._IDs[int(part_id)] = 'occp_cable_bead_{:02d}'.format(index)
+        active_index = layout['active_endpoint_index']
+        active_id = self.cable_bead_IDs[active_index]
+        # PyBullet 3.0.4 rejects world-as-parent fixed constraints. Reversing
+        # parent/child is the exact same world-fixed transform in that build.
+        self.active_endpoint_stabilizer_id = int(p.createConstraint(
+            parentBodyUniqueId=active_id,
+            parentLinkIndex=-1,
+            childBodyUniqueId=-1,
+            childLinkIndex=-1,
+            jointType=p.JOINT_FIXED,
+            jointAxis=(0, 0, 0),
+            parentFramePosition=(0, 0, 0),
+            parentFrameOrientation=(0, 0, 0, 1),
+            childFramePosition=positions[active_index].tolist(),
+            childFrameOrientation=orientations[active_index]))
+
+    def release_active_endpoint_stabilizer(self):
+        if self.active_endpoint_stabilizer_id is None:
+            return
+        p.removeConstraint(self.active_endpoint_stabilizer_id)
+        self.active_endpoint_stabilizer_id = None
 
     def _create_hidden_pin(self, layout):
         collision = p.createCollisionShape(
@@ -136,6 +192,14 @@ class OCCPAuditCable(CableEnv):
         # baseVisualShapeIndex=-1. Keep that compatibility entry transparent.
         p.changeVisualShape(
             self.pin_body_id, -1, rgbaColor=[0.0, 0.0, 0.0, 0.0])
+        try:
+            p.changeDynamics(
+                self.pin_body_id, -1,
+                lateralFriction=self.geometry_config.pin_lateral_friction,
+                collisionMargin=self.geometry_config.collision_margin_m)
+        except TypeError as exc:
+            raise RuntimeError(
+                'PyBullet does not support the required collisionMargin') from exc
         self._IDs[self.pin_body_id] = 'occp_hidden_pin'
 
     def _create_occluder(self, layout):
@@ -180,7 +244,8 @@ class OCCPAuditCable(CableEnv):
         self._oracle_contact_beads = set()
 
     def set_ccda_phase(self, phase):
-        if phase not in ('no_action', 'probe', 'test_pull', 'post_test'):
+        if phase not in (
+                'no_action', 'probe', 'post_probe', 'test_pull', 'post_test'):
             raise ValueError('unknown OCCP phase: {}'.format(phase))
         self._phase = str(phase)
 
@@ -225,6 +290,16 @@ class OCCPAuditCable(CableEnv):
             'bead_indices': [int(value) for value in indices],
         }
 
+    def _oracle_pin_min_signed_distance(self):
+        minimum = float('inf')
+        for bead_id in self.cable_bead_IDs:
+            points = p.getClosestPoints(
+                bodyA=self.pin_body_id, bodyB=bead_id, distance=0.05)
+            for point in points:
+                if len(point) > 8:
+                    minimum = min(minimum, float(point[8]))
+        return minimum if np.isfinite(minimum) else 0.05
+
     def _trace_sample(self):
         bead_positions = self._bead_positions()
         bead_velocities = np.asarray([
@@ -263,9 +338,12 @@ class OCCPAuditCable(CableEnv):
             'sensor_suction_torque_xyz': sensor['suction_torque_xyz'],
             'sensor_grasp_active': sensor['grasp_active'],
             'sensor_constraint_available': sensor['constraint_available'],
+            'visible_mask': self._layout['visible_mask'].astype(int).tolist(),
             'oracle_pin_contact_force': oracle['force'],
             'oracle_pin_contact_count': oracle['count'],
             'oracle_pin_contact_bead_indices': oracle['bead_indices'],
+            'oracle_pin_min_signed_distance': (
+                self._oracle_pin_min_signed_distance()),
         }
 
     def ccda_trace(self):
