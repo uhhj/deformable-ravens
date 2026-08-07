@@ -164,3 +164,24 @@ def test_spatial_sensor_is_grasp_plus_four_patches(monkeypatch):
     )
     sensor = task.spatial_contact_sensor()
     np.testing.assert_array_equal(sensor, np.arange(1.0, 19.0))
+
+
+def test_oracle_internal_load_reads_all_cable_constraints(monkeypatch):
+    task = OHJCablePhase0()
+    task.cable_constraint_ids = list(range(100, 131))
+    calls = []
+
+    def fake_get_constraint_state(constraint):
+        calls.append(int(constraint))
+        value = float(constraint - 100)
+        return [value, value + 0.1, value + 0.2]
+
+    monkeypatch.setattr(
+        "ravens.tasks.ccda_ohj_cable.p.getConstraintState",
+        fake_get_constraint_state,
+    )
+    force = task.oracle_internal_cable_constraint_force_xyz()
+    assert calls == list(range(100, 131))
+    assert force.shape == (31, 3)
+    np.testing.assert_allclose(
+        force[:, 0], np.arange(31, dtype=np.float64))

@@ -342,6 +342,22 @@ class OHJCablePhase0(CableEnv):
                 total_force += float(contact[9]) if len(contact) > 9 else 0.0
         return float(total_force), indices
 
+    def oracle_internal_cable_constraint_force_xyz(self):
+        rows = []
+        for constraint in self.cable_constraint_ids:
+            state = np.asarray(
+                p.getConstraintState(int(constraint)),
+                dtype=np.float64,
+            ).reshape(-1)
+            if state.size < 3:
+                raise RuntimeError(
+                    "OHJ P2P constraint diagnostic must expose "
+                    "3 translational force components")
+            rows.append(state[:3].copy())
+        force = np.asarray(rows, dtype=np.float64)
+        assert force.shape == (len(self.cable_constraint_ids), 3)
+        return force
+
     def _trace_sample(self):
         all_beads = self._bead_positions()
         ee = np.asarray(p.getLinkState(
@@ -349,6 +365,12 @@ class OHJCablePhase0(CableEnv):
             computeForwardKinematics=True)[0], dtype=np.float64)
         observation = self._environment.ccda_sensor_observation()
         latch_force, latch_beads = self._oracle_latch_contact()
+        latch_bead_mask = np.zeros(
+            len(self.cable_bead_IDs), dtype=np.int8)
+        if latch_beads:
+            latch_bead_mask[np.asarray(latch_beads, dtype=np.int64)] = 1
+        internal_constraint_force = (
+            self.oracle_internal_cable_constraint_force_xyz())
         reference = (all_beads[:4].mean(axis=0)
                      if self.reference_passive_xyz is None
                      else np.asarray(self.reference_passive_xyz))
@@ -388,6 +410,10 @@ class OHJCablePhase0(CableEnv):
             "extraction_progress_m": self.extraction_progress_m(reference),
             "oracle_latch_contact_force": latch_force,
             "oracle_latch_contact_count": len(latch_beads),
+            "oracle_latch_contact_bead_mask": latch_bead_mask.astype(
+                int).tolist(),
+            "oracle_internal_cable_constraint_force_xyz": (
+                internal_constraint_force.astype(float).tolist()),
         }
 
     def ccda_trace(self):
