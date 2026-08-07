@@ -26,7 +26,7 @@ from ravens.tasks.defs_cloth import (
         ClothFlat, ClothFlatNoTarget, ClothCover)
 from ravens.tasks.defs_bags import (
         BagAloneOpen, BagItemsEasy, BagItemsHard, BagColorGoal)
-from ravens.tasks.ccda_occp_audit import OCCPAuditCable
+from ravens.tasks.ccda_ohj_cable import OHJCablePhase0
 
 names = {'sorting':             Sorting,
          'insertion':           Insertion,
@@ -53,5 +53,5 @@ names = {'sorting':             Sorting,
          'bag-items-easy':      BagItemsEasy,
          'bag-items-hard':      BagItemsHard,
          'bag-color-goal':      BagColorGoal,
-         'ccda-occp-audit':     OCCPAuditCable,
+         'ccda-ohj-cable-phase0': OHJCablePhase0,
 }
