@@ -26,6 +26,10 @@ def test_trace_separates_formal_wrench_diagnostics_and_oracle(monkeypatch):
     monkeypatch.setattr(task, "statediff_state", lambda: np.zeros(51))
     monkeypatch.setattr(task, "formal_contact_sensor",
                         lambda: np.arange(1.0, 7.0))
+    monkeypatch.setattr(task, "_gripper_surface_contacts",
+                        lambda: [object(), object()])
+    monkeypatch.setattr(task, "gripper_surface_tactile_force",
+                        lambda: np.arange(7.0, 10.0))
     monkeypatch.setattr(task, "_oracle_latch_contact", lambda: (9.0, [1]))
     monkeypatch.setattr(
         "ravens.tasks.ccda_ohj_cable.p.getLinkState",
@@ -33,5 +37,9 @@ def test_trace_separates_formal_wrench_diagnostics_and_oracle(monkeypatch):
     row = task._trace_sample()
     assert len(row["statediff_state"]) == 51
     assert row["formal_wrench"] == list(np.arange(1.0, 7.0))
+    assert row["gripper_surface_tactile_force"] == list(
+        np.arange(7.0, 10.0))
+    assert row["gripper_surface_contact_count"] == 2
+    assert row["formal_sensor"] == list(np.arange(1.0, 10.0))
     assert row["oracle_latch_contact_force"] == 9.0
     assert "oracle" not in "formal_wrench"

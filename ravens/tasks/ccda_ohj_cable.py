@@ -233,6 +233,50 @@ class OHJCablePhase0(CableEnv):
         assert sensor.shape == (6,)
         return sensor
 
+    def _gripper_surface_contacts(self):
+        ee = self._environment.ee
+        active_id = self.cable_bead_IDs[
+            self._layout["active_endpoint_index"]]
+        return p.getContactPoints(
+            bodyA=ee.body,
+            bodyB=active_id,
+            linkIndexA=0,
+        )
+
+    def gripper_surface_tactile_force(self):
+        contacts = self._gripper_surface_contacts()
+        force_world = np.zeros(3, dtype=np.float64)
+        for point in contacts:
+            normal = np.asarray(point[7], dtype=np.float64)
+            normal_force = float(point[9])
+            force_world += normal * normal_force
+            if len(point) > 11:
+                friction_1 = float(point[10])
+                direction_1 = np.asarray(point[11], dtype=np.float64)
+                force_world += friction_1 * direction_1
+            if len(point) > 13:
+                friction_2 = float(point[12])
+                direction_2 = np.asarray(point[13], dtype=np.float64)
+                force_world += friction_2 * direction_2
+        ee = self._environment.ee
+        link_state = p.getLinkState(
+            ee.body, 0, computeForwardKinematics=True)
+        rotation = np.asarray(
+            p.getMatrixFromQuaternion(link_state[1]),
+            dtype=np.float64,
+        ).reshape(3, 3)
+        force_local = rotation.T @ force_world
+        assert force_local.shape == (3,)
+        return force_local
+
+    def combined_contact_sensor(self):
+        sensor = np.concatenate([
+            self.formal_contact_sensor(),
+            self.gripper_surface_tactile_force(),
+        ]).astype(np.float64)
+        assert sensor.shape == (9,)
+        return sensor
+
     def extraction_progress_m(self, reference_passive_xyz):
         current = self._bead_positions()[:4].mean(axis=0)
         direction = np.asarray(self._layout["pull_direction"], dtype=np.float64)
@@ -260,6 +304,13 @@ class OHJCablePhase0(CableEnv):
         reference = (all_beads[:4].mean(axis=0)
                      if self.reference_passive_xyz is None
                      else np.asarray(self.reference_passive_xyz))
+        wrist_wrench = self.formal_contact_sensor()
+        surface_contacts = self._gripper_surface_contacts()
+        surface_tactile = self.gripper_surface_tactile_force()
+        formal_sensor = np.concatenate([
+            wrist_wrench,
+            surface_tactile,
+        ]).astype(np.float64)
         return {
             "physics_step": self.physics_step_count(),
             "phase": self._phase,
@@ -267,7 +318,11 @@ class OHJCablePhase0(CableEnv):
             "visible_keypoints": self.visible_keypoints().astype(float).tolist(),
             "all_bead_positions": all_beads.astype(float).tolist(),
             "ee_position": ee.astype(float).tolist(),
-            "formal_wrench": self.formal_contact_sensor().astype(float).tolist(),
+            "formal_wrench": wrist_wrench.astype(float).tolist(),
+            "gripper_surface_tactile_force": surface_tactile.astype(
+                float).tolist(),
+            "gripper_surface_contact_count": int(len(surface_contacts)),
+            "formal_sensor": formal_sensor.astype(float).tolist(),
             "joint_motor_torque": observation["joint_motor_torque"],
             "joint_reaction_wrench": observation[
                 "joint_reaction_force_torque"],

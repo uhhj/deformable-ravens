@@ -37,3 +37,70 @@ def test_formal_sensor_is_only_suction_force_and_torque():
         })
     np.testing.assert_array_equal(
         task.formal_contact_sensor(), np.arange(1.0, 7.0))
+
+
+def test_gripper_surface_contacts_only_query_active_endpoint(monkeypatch):
+    task = OHJCablePhase0()
+    task.cable_bead_IDs = list(range(100, 132))
+    task._layout = {"active_endpoint_index": 31}
+    task._environment = types.SimpleNamespace(
+        ee=types.SimpleNamespace(body=55))
+    calls = []
+
+    def fake_get_contact_points(**kwargs):
+        calls.append(kwargs)
+        return ()
+
+    monkeypatch.setattr(
+        "ravens.tasks.ccda_ohj_cable.p.getContactPoints",
+        fake_get_contact_points,
+    )
+    task._gripper_surface_contacts()
+    assert calls == [{
+        "bodyA": 55,
+        "bodyB": 131,
+        "linkIndexA": 0,
+    }]
+
+
+def test_gripper_surface_tactile_uses_contact_manifold(monkeypatch):
+    task = OHJCablePhase0()
+    task._environment = types.SimpleNamespace(
+        ee=types.SimpleNamespace(body=55))
+    contact = [None] * 14
+    contact[7] = [1.0, 0.0, 0.0]
+    contact[9] = 2.0
+    contact[10] = 0.5
+    contact[11] = [0.0, 1.0, 0.0]
+    contact[12] = -0.25
+    contact[13] = [0.0, 0.0, 1.0]
+    monkeypatch.setattr(
+        task, "_gripper_surface_contacts", lambda: [tuple(contact)])
+    monkeypatch.setattr(
+        "ravens.tasks.ccda_ohj_cable.p.getLinkState",
+        lambda *args, **kwargs: (
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ),
+    )
+    monkeypatch.setattr(
+        "ravens.tasks.ccda_ohj_cable.p.getMatrixFromQuaternion",
+        lambda quat: [
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ],
+    )
+    force = task.gripper_surface_tactile_force()
+    np.testing.assert_allclose(force, [2.0, 0.5, -0.25])
+
+
+def test_combined_sensor_is_grasp_wrench_plus_surface_tactile(monkeypatch):
+    task = OHJCablePhase0()
+    monkeypatch.setattr(
+        task, "formal_contact_sensor", lambda: np.arange(1.0, 7.0))
+    monkeypatch.setattr(
+        task, "gripper_surface_tactile_force",
+        lambda: np.arange(7.0, 10.0))
+    sensor = task.combined_contact_sensor()
+    np.testing.assert_array_equal(sensor, np.arange(1.0, 10.0))
