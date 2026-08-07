@@ -6,6 +6,18 @@ from ravens.tasks.ccda_ohj_cable import OHJCablePhase0
 from ravens.tasks.ccda_ohj_geometry import VISIBLE_KEYPOINT_INDICES
 
 
+def _contact(position, normal, normal_force):
+    row = [None] * 14
+    row[5] = list(position)
+    row[7] = list(normal)
+    row[9] = float(normal_force)
+    row[10] = 0.0
+    row[11] = [0.0, 1.0, 0.0]
+    row[12] = 0.0
+    row[13] = [0.0, 0.0, 1.0]
+    return tuple(row)
+
+
 def test_state_is_16_visible_keypoints_plus_ee(monkeypatch):
     task = OHJCablePhase0()
     task.cable_bead_IDs = list(range(32))
@@ -104,3 +116,51 @@ def test_combined_sensor_is_grasp_wrench_plus_surface_tactile(monkeypatch):
         lambda: np.arange(7.0, 10.0))
     sensor = task.combined_contact_sensor()
     np.testing.assert_array_equal(sensor, np.arange(1.0, 10.0))
+
+
+def test_surface_tactile_patches_preserve_spatial_force(monkeypatch):
+    task = OHJCablePhase0()
+    task._environment = types.SimpleNamespace(
+        ee=types.SimpleNamespace(body=55))
+    contacts = [
+        _contact([0.001, 0.001, 0.0], [1.0, 0.0, 0.0], 1.0),
+        _contact([-0.001, 0.001, 0.0], [1.0, 0.0, 0.0], 2.0),
+        _contact([-0.001, -0.001, 0.0], [1.0, 0.0, 0.0], 3.0),
+        _contact([0.001, -0.001, 0.0], [1.0, 0.0, 0.0], 4.0),
+    ]
+    monkeypatch.setattr(
+        task, "_gripper_surface_contacts", lambda: contacts)
+    monkeypatch.setattr(
+        "ravens.tasks.ccda_ohj_cable.p.getLinkState",
+        lambda *args, **kwargs: (
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ),
+    )
+    monkeypatch.setattr(
+        "ravens.tasks.ccda_ohj_cable.p.getMatrixFromQuaternion",
+        lambda quat: [
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ],
+    )
+    force, count = task.gripper_surface_tactile_patches()
+    np.testing.assert_allclose(force[:, 0], [1.0, 2.0, 3.0, 4.0])
+    np.testing.assert_array_equal(count, [1, 1, 1, 1])
+
+
+def test_spatial_sensor_is_grasp_plus_four_patches(monkeypatch):
+    task = OHJCablePhase0()
+    monkeypatch.setattr(
+        task, "formal_contact_sensor", lambda: np.arange(1.0, 7.0))
+    monkeypatch.setattr(
+        task,
+        "gripper_surface_tactile_patches",
+        lambda: (
+            np.arange(7.0, 19.0).reshape(4, 3),
+            np.ones(4, dtype=np.int64),
+        ),
+    )
+    sensor = task.spatial_contact_sensor()
+    np.testing.assert_array_equal(sensor, np.arange(1.0, 19.0))

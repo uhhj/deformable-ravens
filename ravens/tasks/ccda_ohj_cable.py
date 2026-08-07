@@ -17,6 +17,33 @@ def _world_point_to_local(body_position, body_orientation, world_point):
     return local
 
 
+def _surface_contact_force_world(point):
+    force = (
+        np.asarray(point[7], dtype=np.float64)
+        * float(point[9]))
+    if len(point) > 11:
+        force = force + (
+            np.asarray(point[11], dtype=np.float64)
+            * float(point[10]))
+    if len(point) > 13:
+        force = force + (
+            np.asarray(point[13], dtype=np.float64)
+            * float(point[12]))
+    return force
+
+
+def _tactile_patch_index(local_position):
+    x = float(local_position[0])
+    y = float(local_position[1])
+    if x >= 0.0 and y >= 0.0:
+        return 0
+    if x < 0.0 and y >= 0.0:
+        return 1
+    if x < 0.0 and y < 0.0:
+        return 2
+    return 3
+
+
 class OHJCablePhase0(CableEnv):
     def __init__(self):
         super().__init__()
@@ -247,17 +274,7 @@ class OHJCablePhase0(CableEnv):
         contacts = self._gripper_surface_contacts()
         force_world = np.zeros(3, dtype=np.float64)
         for point in contacts:
-            normal = np.asarray(point[7], dtype=np.float64)
-            normal_force = float(point[9])
-            force_world += normal * normal_force
-            if len(point) > 11:
-                friction_1 = float(point[10])
-                direction_1 = np.asarray(point[11], dtype=np.float64)
-                force_world += friction_1 * direction_1
-            if len(point) > 13:
-                friction_2 = float(point[12])
-                direction_2 = np.asarray(point[13], dtype=np.float64)
-                force_world += friction_2 * direction_2
+            force_world += _surface_contact_force_world(point)
         ee = self._environment.ee
         link_state = p.getLinkState(
             ee.body, 0, computeForwardKinematics=True)
@@ -269,12 +286,43 @@ class OHJCablePhase0(CableEnv):
         assert force_local.shape == (3,)
         return force_local
 
+    def gripper_surface_tactile_patches(self):
+        contacts = self._gripper_surface_contacts()
+        ee = self._environment.ee
+        link_state = p.getLinkState(
+            ee.body, 0, computeForwardKinematics=True)
+        tip_position = np.asarray(link_state[0], dtype=np.float64)
+        rotation = np.asarray(
+            p.getMatrixFromQuaternion(link_state[1]),
+            dtype=np.float64,
+        ).reshape(3, 3)
+        patch_force = np.zeros((4, 3), dtype=np.float64)
+        patch_count = np.zeros(4, dtype=np.int64)
+        for point in contacts:
+            position_world = np.asarray(point[5], dtype=np.float64)
+            position_local = rotation.T @ (position_world - tip_position)
+            patch = _tactile_patch_index(position_local)
+            force_world = _surface_contact_force_world(point)
+            force_local = rotation.T @ force_world
+            patch_force[patch] += force_local
+            patch_count[patch] += 1
+        return patch_force, patch_count
+
     def combined_contact_sensor(self):
         sensor = np.concatenate([
             self.formal_contact_sensor(),
             self.gripper_surface_tactile_force(),
         ]).astype(np.float64)
         assert sensor.shape == (9,)
+        return sensor
+
+    def spatial_contact_sensor(self):
+        patch_force, _ = self.gripper_surface_tactile_patches()
+        sensor = np.concatenate([
+            self.formal_contact_sensor(),
+            patch_force.reshape(-1),
+        ]).astype(np.float64)
+        assert sensor.shape == (18,)
         return sensor
 
     def extraction_progress_m(self, reference_passive_xyz):
@@ -305,11 +353,16 @@ class OHJCablePhase0(CableEnv):
                      if self.reference_passive_xyz is None
                      else np.asarray(self.reference_passive_xyz))
         wrist_wrench = self.formal_contact_sensor()
-        surface_contacts = self._gripper_surface_contacts()
-        surface_tactile = self.gripper_surface_tactile_force()
+        patch_force, patch_count = self.gripper_surface_tactile_patches()
+        surface_tactile = np.sum(patch_force, axis=0)
+        surface_contact_count = int(np.sum(patch_count))
         formal_sensor = np.concatenate([
             wrist_wrench,
             surface_tactile,
+        ]).astype(np.float64)
+        formal_sensor_spatial = np.concatenate([
+            wrist_wrench,
+            patch_force.reshape(-1),
         ]).astype(np.float64)
         return {
             "physics_step": self.physics_step_count(),
@@ -321,8 +374,14 @@ class OHJCablePhase0(CableEnv):
             "formal_wrench": wrist_wrench.astype(float).tolist(),
             "gripper_surface_tactile_force": surface_tactile.astype(
                 float).tolist(),
-            "gripper_surface_contact_count": int(len(surface_contacts)),
+            "gripper_surface_contact_count": surface_contact_count,
             "formal_sensor": formal_sensor.astype(float).tolist(),
+            "gripper_surface_tactile_patch_force": patch_force.astype(
+                float).tolist(),
+            "gripper_surface_tactile_patch_contact_count": patch_count.astype(
+                int).tolist(),
+            "formal_sensor_spatial": formal_sensor_spatial.astype(
+                float).tolist(),
             "joint_motor_torque": observation["joint_motor_torque"],
             "joint_reaction_wrench": observation[
                 "joint_reaction_force_torque"],

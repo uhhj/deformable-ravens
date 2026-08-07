@@ -26,10 +26,14 @@ def test_trace_separates_formal_wrench_diagnostics_and_oracle(monkeypatch):
     monkeypatch.setattr(task, "statediff_state", lambda: np.zeros(51))
     monkeypatch.setattr(task, "formal_contact_sensor",
                         lambda: np.arange(1.0, 7.0))
-    monkeypatch.setattr(task, "_gripper_surface_contacts",
-                        lambda: [object(), object()])
-    monkeypatch.setattr(task, "gripper_surface_tactile_force",
-                        lambda: np.arange(7.0, 10.0))
+    monkeypatch.setattr(
+        task,
+        "gripper_surface_tactile_patches",
+        lambda: (
+            np.arange(7.0, 19.0).reshape(4, 3),
+            np.asarray([1, 2, 3, 4], dtype=np.int64),
+        ),
+    )
     monkeypatch.setattr(task, "_oracle_latch_contact", lambda: (9.0, [1]))
     monkeypatch.setattr(
         "ravens.tasks.ccda_ohj_cable.p.getLinkState",
@@ -37,9 +41,19 @@ def test_trace_separates_formal_wrench_diagnostics_and_oracle(monkeypatch):
     row = task._trace_sample()
     assert len(row["statediff_state"]) == 51
     assert row["formal_wrench"] == list(np.arange(1.0, 7.0))
-    assert row["gripper_surface_tactile_force"] == list(
-        np.arange(7.0, 10.0))
-    assert row["gripper_surface_contact_count"] == 2
-    assert row["formal_sensor"] == list(np.arange(1.0, 10.0))
+    expected_aggregate = np.arange(7.0, 19.0).reshape(4, 3).sum(axis=0)
+    np.testing.assert_allclose(
+        row["gripper_surface_tactile_force"], expected_aggregate)
+    assert row["gripper_surface_contact_count"] == 10
+    np.testing.assert_allclose(
+        row["formal_sensor"],
+        np.concatenate([np.arange(1.0, 7.0), expected_aggregate]))
+    np.testing.assert_allclose(
+        row["gripper_surface_tactile_patch_force"],
+        np.arange(7.0, 19.0).reshape(4, 3))
+    assert row["gripper_surface_tactile_patch_contact_count"] == [1, 2, 3, 4]
+    assert len(row["formal_sensor_spatial"]) == 18
+    np.testing.assert_allclose(
+        row["formal_sensor_spatial"][6:], np.arange(7.0, 19.0))
     assert row["oracle_latch_contact_force"] == 9.0
     assert "oracle" not in "formal_wrench"
