@@ -37,6 +37,7 @@ class OHJCablePhase0(CableEnv):
         self._environment = None
         self._ee_target_position = np.zeros(3, dtype=np.float64)
         self._arm_metadata = {}
+        self.reference_passive_xyz = None
         self.ee = "suction"
         self.primitive = "pick_place"
         self.metric = "cable-target"
@@ -256,8 +257,9 @@ class OHJCablePhase0(CableEnv):
             computeForwardKinematics=True)[0], dtype=np.float64)
         observation = self._environment.ccda_sensor_observation()
         latch_force, latch_beads = self._oracle_latch_contact()
-        reference = np.asarray(self._layout.get(
-            "reference_passive_xyz", all_beads[:4].mean(axis=0)))
+        reference = (all_beads[:4].mean(axis=0)
+                     if self.reference_passive_xyz is None
+                     else np.asarray(self.reference_passive_xyz))
         return {
             "physics_step": self.physics_step_count(),
             "phase": self._phase,
