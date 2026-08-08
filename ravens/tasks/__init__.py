@@ -27,6 +27,8 @@ from ravens.tasks.defs_cloth import (
 from ravens.tasks.defs_bags import (
         BagAloneOpen, BagItemsEasy, BagItemsHard, BagColorGoal)
 from ravens.tasks.ccda_ohj_cable import OHJCablePhase0
+from ravens.tasks.ccda_dhr_cable import (
+        DHRCableControlSmoke)
 
 names = {'sorting':             Sorting,
          'insertion':           Insertion,
@@ -54,4 +56,5 @@ names = {'sorting':             Sorting,
          'bag-items-hard':      BagItemsHard,
          'bag-color-goal':      BagColorGoal,
          'ccda-ohj-cable-phase0': OHJCablePhase0,
+         'ccda-dhr-cable-smoke': DHRCableControlSmoke,
 }
