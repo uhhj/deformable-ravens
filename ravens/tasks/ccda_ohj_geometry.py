@@ -28,6 +28,7 @@ class OHJGeometryConfig:
     latch_height_m: float = 0.06
     jam_surface_clearance_m: float = 0.0005
     free_lateral_offset_m: float = 0.040
+    latch_topology: str = "single_post"
     occluder_padding_x_m: float = 0.012
     occluder_padding_y_m: float = 0.030
     occluder_bottom_z_m: float = 0.025
@@ -42,6 +43,10 @@ def _validate(cfg):
     if min(cfg.cable_radius_m, cfg.bead_mass_kg, cfg.spacing_m,
            cfg.constraint_max_force_n, cfg.latch_radius_m) <= 0:
         raise ValueError("OHJ dimensions and masses must be positive")
+    if cfg.latch_topology not in (
+            "single_post", "dual_post_directional_guide"):
+        raise ValueError(
+            "unknown OHJ latch topology: {}".format(cfg.latch_topology))
 
 
 def build_common_bead_polyline(cfg):
@@ -68,6 +73,19 @@ def build_common_bead_polyline(cfg):
     return positions, yaw
 
 
+def _box_world_y_half_extent(cfg, yaw):
+    half_length = 0.45 * cfg.spacing_m
+    return float(
+        abs(np.sin(float(yaw))) * half_length
+        + abs(np.cos(float(yaw))) * cfg.cable_radius_m)
+
+
+def _directional_guide_index(cfg, latch_index):
+    offset = int(np.ceil((2.0 * cfg.latch_radius_m) / cfg.spacing_m))
+    return int(min(
+        cfg.hidden_end_index, latch_index + max(1, offset)))
+
+
 def compute_ohj_layout(cfg, condition):
     """Return common cable geometry and the selected hidden latch pose."""
     _validate(cfg)
@@ -86,18 +104,48 @@ def compute_ohj_layout(cfg, condition):
         [0.0, cfg.free_lateral_offset_m, 0.0], dtype=np.float64)
     latch_center = (jam_latch_center if condition == "jam_right"
                     else free_latch_center).copy()
+    guide_index = _directional_guide_index(cfg, latch_index)
+    guide_path = positions[guide_index]
+    guide_y_half_extent = _box_world_y_half_extent(
+        cfg, yaw[guide_index])
+    jam_directional_guide_center = np.array([
+        guide_path[0],
+        guide_path[1] - guide_y_half_extent - cfg.latch_radius_m
+        - cfg.jam_surface_clearance_m,
+        cfg.latch_height_m / 2.0,
+    ], dtype=np.float64)
+    free_directional_guide_center = (
+        jam_directional_guide_center
+        + np.array(
+            [0.0, cfg.free_lateral_offset_m, 0.0], dtype=np.float64))
+    directional_guide_center = (
+        jam_directional_guide_center
+        if condition == "jam_right"
+        else free_directional_guide_center).copy()
     hidden = np.arange(
         cfg.hidden_start_index, cfg.hidden_end_index + 1, dtype=np.int64)
-    x_min = float(positions[hidden, 0].min() - cfg.occluder_padding_x_m)
-    x_max = float(positions[hidden, 0].max() + cfg.occluder_padding_x_m)
-    y_min = min(float(positions[hidden, 1].min()),
-                float(jam_latch_center[1] - cfg.latch_radius_m),
-                float(free_latch_center[1] - cfg.latch_radius_m))
-    y_max = max(float(positions[hidden, 1].max()),
-                float(jam_latch_center[1] + cfg.latch_radius_m),
-                float(free_latch_center[1] + cfg.latch_radius_m))
-    y_min -= cfg.occluder_padding_y_m
-    y_max += cfg.occluder_padding_y_m
+    hidden_x_min = float(positions[hidden, 0].min())
+    hidden_x_max = float(positions[hidden, 0].max())
+    hidden_y_min = float(positions[hidden, 1].min())
+    hidden_y_max = float(positions[hidden, 1].max())
+    obstacle_centers = [jam_latch_center, free_latch_center]
+    if cfg.latch_topology == "dual_post_directional_guide":
+        obstacle_centers.extend([
+            jam_directional_guide_center,
+            free_directional_guide_center])
+    obstacle_centers = np.asarray(obstacle_centers, dtype=np.float64)
+    obstacle_x_min = float(
+        np.min(obstacle_centers[:, 0]) - cfg.latch_radius_m)
+    obstacle_x_max = float(
+        np.max(obstacle_centers[:, 0]) + cfg.latch_radius_m)
+    obstacle_y_min = float(
+        np.min(obstacle_centers[:, 1]) - cfg.latch_radius_m)
+    obstacle_y_max = float(
+        np.max(obstacle_centers[:, 1]) + cfg.latch_radius_m)
+    x_min = min(hidden_x_min, obstacle_x_min) - cfg.occluder_padding_x_m
+    x_max = max(hidden_x_max, obstacle_x_max) + cfg.occluder_padding_x_m
+    y_min = min(hidden_y_min, obstacle_y_min) - cfg.occluder_padding_y_m
+    y_max = max(hidden_y_max, obstacle_y_max) + cfg.occluder_padding_y_m
     occluder_center = np.array([
         0.5 * (x_min + x_max), 0.5 * (y_min + y_max),
         cfg.occluder_bottom_z_m + cfg.occluder_height_m / 2.0,
@@ -117,6 +165,12 @@ def compute_ohj_layout(cfg, condition):
         "latch_center": latch_center,
         "jam_latch_center": jam_latch_center,
         "free_latch_center": free_latch_center,
+        "latch_topology": str(cfg.latch_topology),
+        "directional_guide_index": int(guide_index),
+        "directional_guide_y_half_extent": float(guide_y_half_extent),
+        "directional_guide_center": directional_guide_center,
+        "jam_directional_guide_center": jam_directional_guide_center,
+        "free_directional_guide_center": free_directional_guide_center,
         "latch_radius": float(cfg.latch_radius_m),
         "latch_height": float(cfg.latch_height_m),
         "occluder_center": occluder_center,

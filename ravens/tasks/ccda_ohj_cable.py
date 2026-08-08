@@ -55,6 +55,7 @@ class OHJCablePhase0(CableEnv):
         self.initial_settle_seconds = 1.0
         self.cable_constraint_ids = []
         self.latch_body_id = None
+        self.directional_guide_body_id = None
         self.occluder_body_id = None
         self.active_endpoint_stabilizer_id = None
         self._physics_step_count = 0
@@ -92,6 +93,7 @@ class OHJCablePhase0(CableEnv):
         self.cable_bead_IDs = []
         self.cable_constraint_ids = []
         self.latch_body_id = None
+        self.directional_guide_body_id = None
         self.occluder_body_id = None
         self.active_endpoint_stabilizer_id = None
         self._layout = compute_ohj_layout(self.geometry_config, "free")
@@ -185,6 +187,24 @@ class OHJCablePhase0(CableEnv):
             self.latch_body_id, -1,
             lateralFriction=self.geometry_config.bead_lateral_friction)
         self._IDs[self.latch_body_id] = "ohj_hidden_latch"
+        if layout["latch_topology"] == "dual_post_directional_guide":
+            guide_collision = p.createCollisionShape(
+                p.GEOM_CYLINDER,
+                radius=layout["latch_radius"],
+                height=layout["latch_height"])
+            self.directional_guide_body_id = int(p.createMultiBody(
+                baseMass=0.0,
+                baseCollisionShapeIndex=guide_collision,
+                baseVisualShapeIndex=-1,
+                basePosition=layout["directional_guide_center"].tolist()))
+            p.changeVisualShape(
+                self.directional_guide_body_id, -1,
+                rgbaColor=[0.0, 0.0, 0.0, 0.0])
+            p.changeDynamics(
+                self.directional_guide_body_id, -1,
+                lateralFriction=self.geometry_config.bead_lateral_friction)
+            self._IDs[self.directional_guide_body_id] = (
+                "ohj_hidden_directional_guide")
 
     def _create_occluder(self, layout):
         visual = p.createVisualShape(
@@ -203,12 +223,21 @@ class OHJCablePhase0(CableEnv):
         layout = compute_ohj_layout(self.geometry_config, condition)
         p.resetBasePositionAndOrientation(
             self.latch_body_id, layout["latch_center"].tolist(), [0, 0, 0, 1])
+        if self.directional_guide_body_id is not None:
+            p.resetBasePositionAndOrientation(
+                self.directional_guide_body_id,
+                layout["directional_guide_center"].tolist(),
+                [0, 0, 0, 1])
         after = self._bead_positions()
         self.hidden_condition = condition
         self._layout = layout
         self._arm_metadata = {
             "condition": condition,
             "latch_center": layout["latch_center"].astype(float).tolist(),
+            "latch_topology": layout["latch_topology"],
+            "directional_guide_center": (
+                None if self.directional_guide_body_id is None
+                else layout["directional_guide_center"].astype(float).tolist()),
             "arm_max_bead_jump": float(np.max(np.linalg.norm(
                 after - before, axis=1))),
         }
@@ -333,14 +362,19 @@ class OHJCablePhase0(CableEnv):
 
     def _oracle_latch_contact(self):
         total_force = 0.0
-        indices = []
-        for index, bead in enumerate(self.cable_bead_IDs):
-            contacts = p.getContactPoints(self.latch_body_id, bead)
-            if contacts:
-                indices.append(index)
-            for contact in contacts:
-                total_force += float(contact[9]) if len(contact) > 9 else 0.0
-        return float(total_force), indices
+        indices = set()
+        hidden_bodies = [self.latch_body_id]
+        if self.directional_guide_body_id is not None:
+            hidden_bodies.append(self.directional_guide_body_id)
+        for hidden_body in hidden_bodies:
+            for index, bead in enumerate(self.cable_bead_IDs):
+                contacts = p.getContactPoints(hidden_body, bead)
+                if contacts:
+                    indices.add(int(index))
+                for contact in contacts:
+                    total_force += (
+                        float(contact[9]) if len(contact) > 9 else 0.0)
+        return float(total_force), sorted(indices)
 
     def oracle_internal_cable_constraint_force_xyz(self):
         rows = []
