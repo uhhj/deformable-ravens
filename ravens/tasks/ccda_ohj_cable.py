@@ -56,6 +56,8 @@ class OHJCablePhase0(CableEnv):
         self.cable_constraint_ids = []
         self.latch_body_id = None
         self.directional_guide_body_id = None
+        self.hook_side_body_id = None
+        self.hook_stop_body_id = None
         self.occluder_body_id = None
         self.active_endpoint_stabilizer_id = None
         self._physics_step_count = 0
@@ -94,6 +96,8 @@ class OHJCablePhase0(CableEnv):
         self.cable_constraint_ids = []
         self.latch_body_id = None
         self.directional_guide_body_id = None
+        self.hook_side_body_id = None
+        self.hook_stop_body_id = None
         self.occluder_body_id = None
         self.active_endpoint_stabilizer_id = None
         self._layout = compute_ohj_layout(self.geometry_config, "free")
@@ -205,6 +209,32 @@ class OHJCablePhase0(CableEnv):
                 lateralFriction=self.geometry_config.bead_lateral_friction)
             self._IDs[self.directional_guide_body_id] = (
                 "ohj_hidden_directional_guide")
+        elif layout["latch_topology"] == "continuous_l_slot_hook":
+            side_collision = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=layout["hook_side_half_extents"].tolist())
+            stop_collision = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=layout["hook_stop_half_extents"].tolist())
+            self.hook_side_body_id = int(p.createMultiBody(
+                baseMass=0.0,
+                baseCollisionShapeIndex=side_collision,
+                baseVisualShapeIndex=-1,
+                basePosition=layout["hook_side_center"].tolist()))
+            self.hook_stop_body_id = int(p.createMultiBody(
+                baseMass=0.0,
+                baseCollisionShapeIndex=stop_collision,
+                baseVisualShapeIndex=-1,
+                basePosition=layout["hook_stop_center"].tolist()))
+            for body in (self.hook_side_body_id, self.hook_stop_body_id):
+                p.changeVisualShape(
+                    body, -1, rgbaColor=[0.0, 0.0, 0.0, 0.0])
+                p.changeDynamics(
+                    body, -1,
+                    lateralFriction=
+                    self.geometry_config.bead_lateral_friction)
+            self._IDs[self.hook_side_body_id] = "ohj_hidden_hook_side"
+            self._IDs[self.hook_stop_body_id] = "ohj_hidden_hook_stop"
 
     def _create_occluder(self, layout):
         visual = p.createVisualShape(
@@ -228,6 +258,15 @@ class OHJCablePhase0(CableEnv):
                 self.directional_guide_body_id,
                 layout["directional_guide_center"].tolist(),
                 [0, 0, 0, 1])
+        if self.hook_side_body_id is not None:
+            p.resetBasePositionAndOrientation(
+                self.hook_side_body_id,
+                layout["hook_side_center"].tolist(),
+                [0, 0, 0, 1])
+            p.resetBasePositionAndOrientation(
+                self.hook_stop_body_id,
+                layout["hook_stop_center"].tolist(),
+                [0, 0, 0, 1])
         after = self._bead_positions()
         self.hidden_condition = condition
         self._layout = layout
@@ -238,6 +277,12 @@ class OHJCablePhase0(CableEnv):
             "directional_guide_center": (
                 None if self.directional_guide_body_id is None
                 else layout["directional_guide_center"].astype(float).tolist()),
+            "hook_side_center": (
+                None if self.hook_side_body_id is None
+                else layout["hook_side_center"].astype(float).tolist()),
+            "hook_stop_center": (
+                None if self.hook_stop_body_id is None
+                else layout["hook_stop_center"].astype(float).tolist()),
             "arm_max_bead_jump": float(np.max(np.linalg.norm(
                 after - before, axis=1))),
         }
@@ -366,6 +411,9 @@ class OHJCablePhase0(CableEnv):
         hidden_bodies = [self.latch_body_id]
         if self.directional_guide_body_id is not None:
             hidden_bodies.append(self.directional_guide_body_id)
+        if self.hook_side_body_id is not None:
+            hidden_bodies.extend([
+                self.hook_side_body_id, self.hook_stop_body_id])
         for hidden_body in hidden_bodies:
             for index, bead in enumerate(self.cable_bead_IDs):
                 contacts = p.getContactPoints(hidden_body, bead)

@@ -67,3 +67,47 @@ def test_dual_post_guide_is_dimension_derived_and_keeps_primary_post():
         [0.0, dual_cfg.free_lateral_offset_m, 0.0])
     assert np.array_equal(
         dual_free["bead_positions"], dual_jam["bead_positions"])
+
+
+def test_continuous_l_hook_is_clear_contiguous_and_keeps_primary_post():
+    base_cfg = OHJGeometryConfig(jam_surface_clearance_m=0.00025)
+    hook_cfg = OHJGeometryConfig(
+        jam_surface_clearance_m=0.00025,
+        latch_topology="continuous_l_slot_hook")
+    base_jam = compute_ohj_layout(base_cfg, "jam_right")
+    hook_jam = compute_ohj_layout(hook_cfg, "jam_right")
+    hook_free = compute_ohj_layout(hook_cfg, "free")
+    np.testing.assert_allclose(
+        hook_jam["jam_latch_center"], base_jam["jam_latch_center"])
+    assert hook_jam["hook_downstream_index"] == 17
+    assert np.array_equal(
+        hook_jam["hook_support_indices"],
+        np.array([15, 16, 17], dtype=np.int64))
+    positions = hook_jam["bead_positions"]
+    yaw = hook_jam["bead_yaw"]
+    lower_y = []
+    for index in (15, 16, 17):
+        half_length = 0.45 * hook_cfg.spacing_m
+        half_y = (
+            abs(np.sin(yaw[index])) * half_length
+            + abs(np.cos(yaw[index])) * hook_cfg.cable_radius_m)
+        lower_y.append(positions[index, 1] - half_y)
+    expected_stop_top = min(lower_y) - hook_cfg.jam_surface_clearance_m
+    assert np.isclose(hook_jam["hook_stop_top_y"], expected_stop_top)
+    side_center = hook_jam["jam_hook_side_center"]
+    side_half = hook_jam["hook_side_half_extents"]
+    stop_center = hook_jam["jam_hook_stop_center"]
+    stop_half = hook_jam["hook_stop_half_extents"]
+    assert side_center[0] + side_half[0] >= stop_center[0] - stop_half[0]
+    assert np.isclose(
+        side_center[1] - side_half[1],
+        stop_center[1] - stop_half[1])
+    assert stop_center[1] + stop_half[1] > side_center[1] + side_half[1]
+    np.testing.assert_allclose(
+        hook_free["hook_side_center"] - hook_jam["hook_side_center"],
+        [0.0, hook_cfg.free_lateral_offset_m, 0.0])
+    np.testing.assert_allclose(
+        hook_free["hook_stop_center"] - hook_jam["hook_stop_center"],
+        [0.0, hook_cfg.free_lateral_offset_m, 0.0])
+    assert np.array_equal(
+        hook_free["bead_positions"], hook_jam["bead_positions"])

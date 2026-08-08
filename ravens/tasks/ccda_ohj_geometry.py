@@ -44,7 +44,8 @@ def _validate(cfg):
            cfg.constraint_max_force_n, cfg.latch_radius_m) <= 0:
         raise ValueError("OHJ dimensions and masses must be positive")
     if cfg.latch_topology not in (
-            "single_post", "dual_post_directional_guide"):
+            "single_post", "dual_post_directional_guide",
+            "continuous_l_slot_hook"):
         raise ValueError(
             "unknown OHJ latch topology: {}".format(cfg.latch_topology))
 
@@ -73,17 +74,72 @@ def build_common_bead_polyline(cfg):
     return positions, yaw
 
 
-def _box_world_y_half_extent(cfg, yaw):
+def _box_world_xy_half_extents(cfg, yaw):
     half_length = 0.45 * cfg.spacing_m
-    return float(
-        abs(np.sin(float(yaw))) * half_length
-        + abs(np.cos(float(yaw))) * cfg.cable_radius_m)
+    cosine = abs(np.cos(float(yaw)))
+    sine = abs(np.sin(float(yaw)))
+    return np.array([
+        cosine * half_length + sine * cfg.cable_radius_m,
+        sine * half_length + cosine * cfg.cable_radius_m,
+    ], dtype=np.float64)
+
+
+def _box_world_y_half_extent(cfg, yaw):
+    return float(_box_world_xy_half_extents(cfg, yaw)[1])
 
 
 def _directional_guide_index(cfg, latch_index):
     offset = int(np.ceil((2.0 * cfg.latch_radius_m) / cfg.spacing_m))
     return int(min(
         cfg.hidden_end_index, latch_index + max(1, offset)))
+
+
+def _continuous_l_hook_layout(
+        cfg, positions, yaw, latch_index, jam_latch_center):
+    downstream_index = _directional_guide_index(cfg, latch_index)
+    support_indices = np.arange(
+        latch_index, downstream_index + 1, dtype=np.int64)
+    lower_y = []
+    for index in support_indices:
+        half_xy = _box_world_xy_half_extents(cfg, yaw[index])
+        lower_y.append(float(positions[index, 1] - half_xy[1]))
+    stop_top_y = min(lower_y) - cfg.jam_surface_clearance_m
+    wall_half = 0.5 * cfg.cable_radius_m
+    rail_top_y = stop_top_y - cfg.cable_radius_m
+    rail_bottom_y = rail_top_y - 2.0 * wall_half
+    stop_center_x = float(0.5 * (
+        positions[downstream_index - 1, 0]
+        + positions[downstream_index, 0]))
+    rail_start_x = float(jam_latch_center[0])
+    rail_center_x = float(0.5 * (rail_start_x + stop_center_x))
+    rail_half_x = float(
+        0.5 * (stop_center_x - rail_start_x) + wall_half)
+    rail_center_y = float(rail_top_y - wall_half)
+    stop_bottom_y = rail_bottom_y
+    stop_center_y = float(0.5 * (stop_bottom_y + stop_top_y))
+    stop_half_y = float(0.5 * (stop_top_y - stop_bottom_y))
+    half_z = float(cfg.latch_height_m / 2.0)
+    jam_side_center = np.array([
+        rail_center_x, rail_center_y, half_z], dtype=np.float64)
+    side_half_extents = np.array([
+        rail_half_x, wall_half, half_z], dtype=np.float64)
+    jam_stop_center = np.array([
+        stop_center_x, stop_center_y, half_z], dtype=np.float64)
+    stop_half_extents = np.array([
+        wall_half, stop_half_y, half_z], dtype=np.float64)
+    free_shift = np.array(
+        [0.0, cfg.free_lateral_offset_m, 0.0], dtype=np.float64)
+    return {
+        "hook_downstream_index": int(downstream_index),
+        "hook_support_indices": support_indices,
+        "hook_stop_top_y": float(stop_top_y),
+        "jam_hook_side_center": jam_side_center,
+        "free_hook_side_center": jam_side_center + free_shift,
+        "hook_side_half_extents": side_half_extents,
+        "jam_hook_stop_center": jam_stop_center,
+        "free_hook_stop_center": jam_stop_center + free_shift,
+        "hook_stop_half_extents": stop_half_extents,
+    }
 
 
 def compute_ohj_layout(cfg, condition):
@@ -122,6 +178,16 @@ def compute_ohj_layout(cfg, condition):
         jam_directional_guide_center
         if condition == "jam_right"
         else free_directional_guide_center).copy()
+    hook = _continuous_l_hook_layout(
+        cfg, positions, yaw, latch_index, jam_latch_center)
+    hook_side_center = (
+        hook["jam_hook_side_center"]
+        if condition == "jam_right"
+        else hook["free_hook_side_center"]).copy()
+    hook_stop_center = (
+        hook["jam_hook_stop_center"]
+        if condition == "jam_right"
+        else hook["free_hook_stop_center"]).copy()
     hidden = np.arange(
         cfg.hidden_start_index, cfg.hidden_end_index + 1, dtype=np.int64)
     hidden_x_min = float(positions[hidden, 0].min())
@@ -142,6 +208,30 @@ def compute_ohj_layout(cfg, condition):
         np.min(obstacle_centers[:, 1]) - cfg.latch_radius_m)
     obstacle_y_max = float(
         np.max(obstacle_centers[:, 1]) + cfg.latch_radius_m)
+    if cfg.latch_topology == "continuous_l_slot_hook":
+        hook_bounds = []
+        for center, half in (
+                (hook["jam_hook_side_center"],
+                 hook["hook_side_half_extents"]),
+                (hook["free_hook_side_center"],
+                 hook["hook_side_half_extents"]),
+                (hook["jam_hook_stop_center"],
+                 hook["hook_stop_half_extents"]),
+                (hook["free_hook_stop_center"],
+                 hook["hook_stop_half_extents"])):
+            hook_bounds.append((
+                float(center[0] - half[0]),
+                float(center[0] + half[0]),
+                float(center[1] - half[1]),
+                float(center[1] + half[1])))
+        obstacle_x_min = min(
+            obstacle_x_min, min(row[0] for row in hook_bounds))
+        obstacle_x_max = max(
+            obstacle_x_max, max(row[1] for row in hook_bounds))
+        obstacle_y_min = min(
+            obstacle_y_min, min(row[2] for row in hook_bounds))
+        obstacle_y_max = max(
+            obstacle_y_max, max(row[3] for row in hook_bounds))
     x_min = min(hidden_x_min, obstacle_x_min) - cfg.occluder_padding_x_m
     x_max = max(hidden_x_max, obstacle_x_max) + cfg.occluder_padding_x_m
     y_min = min(hidden_y_min, obstacle_y_min) - cfg.occluder_padding_y_m
@@ -171,6 +261,17 @@ def compute_ohj_layout(cfg, condition):
         "directional_guide_center": directional_guide_center,
         "jam_directional_guide_center": jam_directional_guide_center,
         "free_directional_guide_center": free_directional_guide_center,
+        "hook_downstream_index": int(hook["hook_downstream_index"]),
+        "hook_support_indices": hook["hook_support_indices"],
+        "hook_side_center": hook_side_center,
+        "jam_hook_side_center": hook["jam_hook_side_center"],
+        "free_hook_side_center": hook["free_hook_side_center"],
+        "hook_side_half_extents": hook["hook_side_half_extents"],
+        "hook_stop_center": hook_stop_center,
+        "jam_hook_stop_center": hook["jam_hook_stop_center"],
+        "free_hook_stop_center": hook["free_hook_stop_center"],
+        "hook_stop_half_extents": hook["hook_stop_half_extents"],
+        "hook_stop_top_y": float(hook["hook_stop_top_y"]),
         "latch_radius": float(cfg.latch_radius_m),
         "latch_height": float(cfg.latch_height_m),
         "occluder_center": occluder_center,

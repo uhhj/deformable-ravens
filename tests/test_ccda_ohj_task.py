@@ -82,3 +82,45 @@ def test_dual_post_guide_arms_without_initial_penetration_or_cable_jump():
         assert guide_contacts == 0
     finally:
         p.disconnect()
+
+
+def test_continuous_l_hook_arms_without_initial_penetration_or_cable_jump():
+    p.connect(p.DIRECT)
+    try:
+        task = OHJCablePhase0()
+        task.geometry_config = OHJGeometryConfig(
+            jam_surface_clearance_m=0.00025,
+            latch_topology="continuous_l_slot_hook")
+        task.object_points = {}
+        task._IDs = {}
+        task.cable_bead_IDs = []
+        task.cable_constraint_ids = []
+        free_layout = compute_ohj_layout(task.geometry_config, "free")
+        task._create_cable(types.SimpleNamespace(objects=[]), free_layout)
+        task._create_hidden_latch(free_layout)
+        task._create_occluder(free_layout)
+        task._layout = free_layout
+        assert task.hook_side_body_id is not None
+        assert task.hook_stop_body_id is not None
+        before = task._bead_positions().copy()
+        result = task.arm_condition("jam_right")
+        after = task._bead_positions()
+        np.testing.assert_array_equal(before, after)
+        assert result["arm_max_bead_jump"] == 0.0
+        assert result["latch_topology"] == "continuous_l_slot_hook"
+        jam_layout = compute_ohj_layout(task.geometry_config, "jam_right")
+        side_position = np.asarray(p.getBasePositionAndOrientation(
+            task.hook_side_body_id)[0], dtype=np.float64)
+        stop_position = np.asarray(p.getBasePositionAndOrientation(
+            task.hook_stop_body_id)[0], dtype=np.float64)
+        np.testing.assert_allclose(
+            side_position, jam_layout["hook_side_center"])
+        np.testing.assert_allclose(
+            stop_position, jam_layout["hook_stop_center"])
+        for hidden_body in (task.hook_side_body_id, task.hook_stop_body_id):
+            penetrating = sum(
+                len(p.getClosestPoints(hidden_body, bead, distance=0.0))
+                for bead in task.cable_bead_IDs)
+            assert penetrating == 0
+    finally:
+        p.disconnect()
